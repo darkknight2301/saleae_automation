@@ -1,0 +1,36 @@
+# =====================================================================
+# Saleae Logic 8 Automation Wrapper - Configuration
+# =====================================================================
+# Loaded by saleae_wrapper.SaleaeConfig.from_yaml() on Saleae() startup.
+# Relative paths are resolved against the current working directory.
+
+# --- Automation Server connection -------------------------------------
+host: "127.0.0.1"
+port: 10430
+
+# --- Logic 2 process management -----------------------------------------
+# If true, the wrapper will attempt to launch Logic 2 headlessly when it
+# cannot reach a running Automation Server on host:port. If false, the
+# wrapper will only try to connect and will raise ConnectionError when no
+# server is found.
+launch_logic2: false
+logic2_binary: "/opt/Logic/Logic"
+
+# Seconds to wait for the Automation API port to accept connections after
+# launching Logic 2.
+startup_timeout: 30
+
+# --- Capture configuration ------------------------------------------------
+sample_rate: 500000000          # 500 MS/s digital sample rate
+digital_channels: [0, 1, 2, 3]  # Digital channel indices to enable
+analog_channels: []             # Analog channel indices to enable
+capture_duration: 1.0           # Default capture duration, seconds
+
+# --- Export / output --------------------------------------------------------
+export_directory: "./captures"
+plot_dpi: 150
+figure_size: [10, 6]
+
+# --- Reliability ------------------------------------------------------------
+retry_count: 3                  # Connection retry attempts
+timeout: 10                     # Default per-operation timeout, seconds
