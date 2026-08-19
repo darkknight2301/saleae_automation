@@ -1,0 +1,3 @@
+test: "This is a YAML file and must be rejected by the runner"
+run: "echo hello"
+expect_exit: 0

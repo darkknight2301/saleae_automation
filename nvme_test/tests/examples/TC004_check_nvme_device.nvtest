@@ -1,0 +1,12 @@
+# Safe: lsblk is read-only and available on any Linux system. Checks
+# whether an NVMe block device is visible to the OS. Result depends on the
+# actual hardware present -- on a machine/container with no NVMe device
+# this will legitimately FAIL, which is expected and correct behavior.
+TEST "Check NVMe Device"
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+EXPECT "nvme" CONTAINS "nvme"
+
+END

@@ -1,0 +1,10 @@
+TEST "Mock Identify Controller - Failing Validation"
+
+RUN "printf 'Model Number   : Kioxia KXG60ZNV\nFirmware Revision : 1A1AEXM2\n'"
+
+EXPECT_EXIT 0
+EXPECT "Model Number" CONTAINS "Samsung"
+EXPECT "Firmware Revision" NOT_EMPTY
+EXPECT "ERROR" NOT_CONTAINS
+
+END

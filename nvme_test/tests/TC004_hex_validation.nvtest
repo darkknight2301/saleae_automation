@@ -1,0 +1,9 @@
+TEST "Mock Binary Output - Hex Validation"
+
+RUN "python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(\"1234567800000000\"))'"
+
+EXPECT_EXIT 0
+EXPECT_HEX 0x00 "12345678"
+EXPECT_HEX 0x04 "00000000"
+
+END

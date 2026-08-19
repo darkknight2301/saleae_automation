@@ -1,0 +1,5 @@
+TEST "Invalid Syntax Example"
+
+RUN "echo hello"
+
+EXPECT_EXIT zero
