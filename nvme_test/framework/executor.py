@@ -42,12 +42,15 @@ class CommandResult:
         return self.stderr.decode("utf-8", errors=errors)
 
 
-class Executor:
+class CommandExecutor:
     """Executes shell commands and captures their result.
 
     A single execute()/run() method handles every command type -- nvme-cli,
     fio, or any other Linux command. Nothing here is NVMe- or fio-aware.
     """
+
+    def __init__(self, default_timeout: float = None):
+        self.default_timeout = default_timeout
 
     def run(self, command, shell: bool = True, timeout: float = None) -> CommandResult:
         """Run a command and capture exit code, stdout, and stderr as raw bytes.
@@ -56,11 +59,14 @@ class Executor:
             command: command string (or list of args if shell=False).
             shell:   run through the shell (default True; lets callers pass
                      full command lines like "nvme id-ctrl /dev/nvme0").
-            timeout: optional timeout in seconds.
+            timeout: optional timeout in seconds; falls back to
+                     self.default_timeout (from ConfigManager) if not given.
 
         Returns:
             CommandResult with raw bytes always populated for stdout/stderr.
         """
+        if timeout is None:
+            timeout = self.default_timeout
         start = time.time()
         try:
             proc = subprocess.run(
@@ -102,3 +108,7 @@ class Executor:
             start_time=start,
             end_time=end,
         )
+
+
+# Backward-compat alias (Executor was renamed to CommandExecutor).
+Executor = CommandExecutor

@@ -1,0 +1,16 @@
+# This file is a TEMPLATE, not an active configuration file: it is only
+# applied when explicitly passed via --config, e.g.
+#     python3 run.py tests/ --config config/config.yaml
+# ConfigManager does NOT auto-discover or load this file by default
+# (review finding F-3). Without --config, the framework uses its built-in
+# defaults (framework/config_manager.py: _DEFAULTS), which currently match
+# every value below. Edit this file freely, then pass --config to use it.
+framework:
+  log_directory: logs
+  log_level: INFO
+
+execution:
+  command_timeout: 300
+
+variables:
+  file: common_variables.json

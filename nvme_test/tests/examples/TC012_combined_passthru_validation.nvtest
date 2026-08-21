@@ -1,0 +1,20 @@
+# Requires: nvme-cli installed AND a real NVMe controller at {{device}}.
+# Read-only (--read, Identify opcode), but requires real hardware to
+# produce meaningful bytes, so it is not auto-executed by the framework's
+# own verification.
+#
+# Combined-automation Example 4: passthru + binary validation. Proves
+# EXPECT_BYTE/EXPECT_HEX work against a raw admin-passthru response, and
+# that {{device}} substitution also applies inside RUN for binary commands.
+TEST "Combined Example 4 - Admin Passthru + Binary Validation"
+
+RUN "nvme admin-passthru {{device}} --opcode=0x06 --cdw10=1 --data-len=4096 --read --raw-binary"
+
+EXPECT_EXIT 0
+# Bytes 0-1 of the Identify Controller structure are the PCI Vendor ID
+# (VID), little-endian. Replace with your controller's actual VID.
+EXPECT_BYTE 0x00 0x00
+EXPECT_BYTE 0x01 0x00
+EXPECT_HEX 0x00 "0000"
+
+END

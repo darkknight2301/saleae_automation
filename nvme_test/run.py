@@ -29,7 +29,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from framework.executor import Executor
 from framework.logger import Logger
 from framework.parser import ParseError, parse_file
-from framework.runner import run_nvtest_file, UnsupportedFileTypeError
+from framework.runner import run_nvtest_file, UnsupportedFileTypeError, TestRunner
+from framework.config_manager import ConfigManager
+from framework.variable_manager import VariableManager, VariableError
+from framework.framework_log import FrameworkLogger
 from framework import cli
 
 
@@ -135,16 +138,17 @@ def nvtest_invalid_syntax():
     """TC005: malformed .nvtest syntax must be rejected with ParseError,
     and must NOT produce a .log file (nothing should have executed)."""
     path = os.path.join(TESTS_DIR, "TC005_invalid_syntax.nvtest")
-    log_path = os.path.join("logs", "Invalid_Syntax_Example.log")
-    if os.path.exists(log_path):
-        os.remove(log_path)
 
+    test_runner = TestRunner(config=ConfigManager())
     try:
-        run_nvtest_file(path)
+        test_runner.run(path)
         raise AssertionError("expected ParseError for invalid .nvtest syntax, but none was raised")
     except ParseError as exc:
-        assert not os.path.exists(log_path), "invalid syntax must not produce a .log file"
+        produced_logs = [f for f in os.listdir(test_runner.run_dir) if f.endswith(".log") and f != "run.log"]
+        assert not produced_logs, f"invalid syntax must not produce a test .log file, found: {produced_logs}"
         print(f"[PASS] nvtest_invalid_syntax -> correctly rejected: {exc}")
+    finally:
+        test_runner.close()
 
 
 def nvtest_unsupported_extension():
@@ -171,6 +175,10 @@ _HARDWARE_OR_DESTRUCTIVE_EXAMPLES = {
     "TC006_fio_write_DESTRUCTIVE.nvtest",   # writes to a raw block device
     "TC007_admin_passthru_HARDWARE_REQUIRED.nvtest",
     "TC008_io_passthru_HARDWARE_REQUIRED.nvtest",
+    "TC009_combined_identify.nvtest",              # needs real hardware
+    "TC010_combined_identify_smart.nvtest",        # needs real hardware
+    "TC011_combined_identify_smart_fio.nvtest",    # DESTRUCTIVE, writes to a raw block device
+    "TC012_combined_passthru_validation.nvtest",   # needs real hardware
 }
 
 # Examples that are genuinely safe to execute (no hardware, no destructive
@@ -207,7 +215,8 @@ def cli_directory():
         "directory discovery must only pick up *.nvtest files"
     )
 
-    rows = cli.run_targets(targets)
+    test_runner = TestRunner(config=ConfigManager())
+    rows = cli.run_targets(targets, test_runner)
     status_by_label = {label: status for label, status, _ in rows}
 
     assert status_by_label["TC001_success"] == "PASS"
@@ -215,16 +224,21 @@ def cli_directory():
     assert status_by_label["TC003_byte_validation"] == "PASS"
     assert status_by_label["TC004_hex_validation"] == "PASS"
     assert status_by_label["TC005_invalid_syntax"] == "ERROR"
+    assert status_by_label["TC008_combined_safe"] == "PASS"
+    assert status_by_label["TC009_missing_variable"] == "ERROR"
 
     # PASS/FAIL rows get a .log; ERROR (parse failure) rows must not.
     for label, status, detail in rows:
-        log_path = os.path.join("logs", f"{label}.log")
         if status == "ERROR":
             continue  # detail is the error message here, not a log path
         assert os.path.exists(detail), f"expected a .log file for {label} at {detail}"
 
-    cli.print_summary(rows)
-    print("[PASS] cli_directory (single directory run covers PASS/FAIL/ERROR/ignored-extension)")
+    # All PASS/FAIL logs from this single invocation share one run directory.
+    log_dirs = {os.path.dirname(detail) for _, status, detail in rows if status != "ERROR"}
+    assert len(log_dirs) == 1, f"expected one shared run directory, got {log_dirs}"
+
+    cli.print_summary(rows, test_runner.log)
+    print("[PASS] cli_directory (single directory run covers PASS/FAIL/ERROR/ignored-extension, shared run dir)")
 
 
 def cli_rejects_unsupported_extension():
@@ -275,6 +289,188 @@ def examples_hardware_ones_not_auto_executed():
     print("[PASS] examples_hardware_ones_not_auto_executed (destructive/hardware examples never executed)")
 
 
+def config_manager_loads_yaml():
+    """YAML config loads and overrides defaults; missing file -> defaults."""
+
+    default_cfg = ConfigManager()
+    assert default_cfg.log_directory == "logs"
+    assert default_cfg.command_timeout == 300
+
+    cfg = ConfigManager("config/config.yaml")
+    assert cfg.log_level == "INFO"
+    assert cfg.variables_file == "common_variables.json"
+    print("[PASS] config_manager_loads_yaml")
+
+
+def variable_manager_loads_and_substitutes():
+    """VariableManager: load/get/substitute/missing-variable detection."""
+
+    vm = VariableManager("common_variables.json")
+    assert vm.get("device") == "/dev/nvme0"
+    assert vm.substitute("nvme id-ctrl {{device}}") == "nvme id-ctrl /dev/nvme0"
+    try:
+        vm.get("does_not_exist")
+        raise AssertionError("expected VariableError for missing variable")
+    except VariableError:
+        pass
+    print("[PASS] variable_manager_loads_and_substitutes")
+
+
+def variable_substitution_end_to_end():
+    """A .nvtest using {{device}} resolves and runs through TestRunner."""
+
+    test_runner = TestRunner(config=ConfigManager())
+    result = test_runner.run("tests/TC007_variable_substitution.nvtest")
+    assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+    print(f"[PASS] variable_substitution_end_to_end -> {result.log_path}")
+
+
+def framework_logger_writes_console_and_file():
+    """FrameworkLogger emits INFO/DEBUG/WARNING/ERROR to console + run.log."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = FrameworkLogger(level="DEBUG", run_dir=tmp)
+        log.info("info message")
+        log.debug("debug message")
+        log.warning("warning message")
+        log.error("error message")
+        content = open(log.file_path).read()
+        assert "info message" in content
+        assert "debug message" in content
+        assert "[ERROR]" in content
+    print("[PASS] framework_logger_writes_console_and_file")
+
+
+def run_directory_created_and_shared():
+    """One TestRunner -> one logs/{timestamp}/ dir; multiple tests share it."""
+
+    test_runner = TestRunner(config=ConfigManager())
+    r1 = test_runner.run("tests/TC001_success.nvtest")
+    r2 = test_runner.run("tests/TC003_byte_validation.nvtest")
+    assert os.path.dirname(r1.log_path) == os.path.dirname(r2.log_path) == test_runner.run_dir
+    assert os.path.basename(test_runner.run_dir) == test_runner.run_id
+    print(f"[PASS] run_directory_created_and_shared -> {test_runner.run_dir}")
+
+
+def combined_command_context_and_sequencing():
+    """Explicit check (not just implicit via cli_directory): a 4-RUN combined
+    test (mock identify -> mock smart-log -> lsblk -> fio) parses with each
+    EXPECT bound to the correct nearest-preceding RUN via run_index, executes
+    all 4 commands, and every validation runs against its own command's
+    result -- proving command-context binding, not just overall PASS."""
+
+    test_case = parse_file("tests/TC008_combined_safe.nvtest")
+    assert len(test_case.commands) == 4, "expected 4 RUN steps (identify, smart-log, lsblk, fio)"
+    run_indexes = [v.run_index for v in test_case.validations]
+    assert run_indexes == [0, 0, 0, 1, 1, 2, 3], f"unexpected command-context binding: {run_indexes}"
+
+    test_runner = TestRunner(config=ConfigManager())
+    result = test_runner.run("tests/TC008_combined_safe.nvtest")
+    assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+    assert len(result.validation_lines) == 7, "expected all 7 validations to have run"
+    print(f"[PASS] combined_command_context_and_sequencing -> {result.log_path}")
+
+
+def missing_variable_produces_clear_error():
+    """A .nvtest referencing an undefined {{variable}} must fail clearly:
+    VariableError raised, no command executed, no .log written."""
+
+    test_runner = TestRunner(config=ConfigManager())
+    run_dir_before = set(os.listdir(test_runner.run_dir))
+    try:
+        test_runner.run("tests/TC009_missing_variable.nvtest")
+        raise AssertionError("expected VariableError for undefined {{not_a_real_variable}}")
+    except VariableError as exc:
+        run_dir_after = set(os.listdir(test_runner.run_dir))
+        assert run_dir_after == run_dir_before, "missing-variable test must not write a .log file"
+        print(f"[PASS] missing_variable_produces_clear_error -> correctly rejected: {exc}")
+
+
+def cli_run_targets_survives_unexpected_error():
+    """Regression test for review finding F-4: an unanticipated exception
+    while running one target in a directory batch must not prevent the
+    rest of the batch from being reported. Simulated by monkeypatching
+    TestRunner.run to raise a plain RuntimeError for one specific file."""
+    from framework.runner import TestRunner as _TestRunner
+
+    targets = cli.discover_targets(TESTS_DIR)
+    test_runner = TestRunner(config=ConfigManager())
+
+    original_run = _TestRunner.run
+
+    def boom_run(self, path):
+        if path.endswith("TC003_byte_validation.nvtest"):
+            raise RuntimeError("simulated unexpected internal error")
+        return original_run(self, path)
+
+    _TestRunner.run = boom_run
+    try:
+        rows = cli.run_targets(targets, test_runner)
+    finally:
+        _TestRunner.run = original_run
+
+    status_by_label = {label: status for label, status, _ in rows}
+    assert status_by_label["TC003_byte_validation"] == "ERROR", "expected the boomed target to be reported as ERROR"
+    # Every OTHER target in the batch must still have been reported --
+    # this is the exact behavior F-4 found broken (one exception aborted
+    # the whole run_targets() call, silently dropping the rest).
+    assert status_by_label["TC001_success"] == "PASS"
+    assert status_by_label["TC002_failed_validation"] == "FAIL"
+    assert status_by_label["TC004_hex_validation"] == "PASS"
+    assert status_by_label["TC005_invalid_syntax"] == "ERROR"
+    print("[PASS] cli_run_targets_survives_unexpected_error (F-4 regression)")
+
+
+def framework_logger_isolated_across_instances():
+    """Regression test for review finding F-1: FrameworkLogger used a
+    shared, fixed logger name, so a second live TestRunner would silently
+    hijack an earlier one's log output. Construct two TestRunners, log via
+    the first after the second exists, and assert the message lands only
+    in the first's run.log."""
+    r1 = TestRunner(config=ConfigManager())
+    r2 = TestRunner(config=ConfigManager())
+    try:
+        marker = "F-1 regression marker: isolated-per-instance logging"
+        r1.log.info(marker)
+
+        r1_log = open(os.path.join(r1.run_dir, "run.log")).read()
+        r2_log = open(os.path.join(r2.run_dir, "run.log")).read()
+        assert marker in r1_log, "expected message in r1's own run.log"
+        assert marker not in r2_log, "message leaked into r2's run.log (F-1 regression)"
+        assert r1.run_dir != r2.run_dir, "two TestRunners must not share a run directory"
+        print("[PASS] framework_logger_isolated_across_instances (F-1 regression)")
+    finally:
+        r1.close()
+        r2.close()
+
+
+def duplicate_test_names_do_not_collide():
+    """Regression test for review finding F-2: the .log filename was
+    derived from the free-text TEST name, so two different .nvtest files
+    declaring the same TEST name would silently overwrite each other's
+    log. Filename must now derive from the source .nvtest filename."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "A.nvtest"), "w") as f:
+            f.write('TEST "Duplicate Name"\nRUN "echo AAAA"\nEXPECT_EXIT 0\nEND\n')
+        with open(os.path.join(tmp, "B.nvtest"), "w") as f:
+            f.write('TEST "Duplicate Name"\nRUN "echo BBBB"\nEXPECT_EXIT 0\nEND\n')
+
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            result_a = test_runner.run(os.path.join(tmp, "A.nvtest"))
+            result_b = test_runner.run(os.path.join(tmp, "B.nvtest"))
+
+            assert result_a.log_path != result_b.log_path, "A and B must not share a log path (F-2 regression)"
+            assert "AAAA" in open(result_a.log_path).read()
+            assert "BBBB" in open(result_b.log_path).read()
+            print("[PASS] duplicate_test_names_do_not_collide (F-2 regression)")
+        finally:
+            test_runner.close()
+
+
 def main():
     print("Running Phase 1 smoke verification...\n")
     smoke_success()
@@ -299,6 +495,25 @@ def main():
     examples_safe_ones_execute()
     examples_hardware_ones_not_auto_executed()
     print("\nAll Phase 3 verification checks passed.")
+
+    print("\nRunning Phase 2-refactor (architecture) verification...\n")
+    config_manager_loads_yaml()
+    variable_manager_loads_and_substitutes()
+    variable_substitution_end_to_end()
+    framework_logger_writes_console_and_file()
+    run_directory_created_and_shared()
+    print("\nAll architecture-refactor verification checks passed.")
+
+    print("\nRunning Phase 3 combined-automation verification...\n")
+    combined_command_context_and_sequencing()
+    missing_variable_produces_clear_error()
+    cli_run_targets_survives_unexpected_error()
+    print("\nAll combined-automation verification checks passed.")
+
+    print("\nRunning Phase 5 hardening regression checks (F-1, F-2, F-4)...\n")
+    framework_logger_isolated_across_instances()
+    duplicate_test_names_do_not_collide()
+    print("\nAll hardening regression checks passed.")
 
 
 if __name__ == "__main__":

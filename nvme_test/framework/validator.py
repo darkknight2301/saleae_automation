@@ -16,11 +16,20 @@ Design intent (Phase 2):
   module docstring notes below each helper for the exact semantics.
 """
 
+from dataclasses import dataclass
 from typing import List, Tuple
 
 from .parser import (
     TestCase, EXIT, TEXT_CONTAINS, TEXT_NOT_CONTAINS, TEXT_NOT_EMPTY, BYTE, HEX,
 )
+
+
+@dataclass
+class ValidationResult:
+    """A single validation's outcome. Replaces the bare (bool, str) tuple
+    with a named, self-documenting result."""
+    passed: bool
+    message: str
 
 
 def _find_field_line(text: str, field_name: str):
@@ -45,9 +54,12 @@ def _extract_value_after_field(line: str, field_name: str) -> str:
     return remainder.strip().lstrip(":=").strip()
 
 
-def validate(test_case: TestCase, results: List) -> Tuple[List[Tuple[bool, str]], bool]:
+def validate(test_case: TestCase, results: List, variable_manager=None) -> Tuple[List[Tuple[bool, str]], bool]:
     """Run every validation in `test_case` against the matching CommandResult
     in `results` (results[i] is the output of test_case.commands[i]).
+
+    If `variable_manager` is given, {{name}} placeholders in EXPECT values
+    are substituted before comparison (VariableError propagates uncaught).
 
     Returns:
         (validation_lines, all_passed)
@@ -60,6 +72,9 @@ def validate(test_case: TestCase, results: List) -> Tuple[List[Tuple[bool, str]]
 
     for v in test_case.validations:
         result = results[v.run_index]
+        value = v.value
+        if variable_manager is not None and value is not None:
+            value = variable_manager.substitute(value)
 
         if v.kind == EXIT:
             passed = result.exit_code == v.expected_exit
@@ -70,8 +85,8 @@ def validate(test_case: TestCase, results: List) -> Tuple[List[Tuple[bool, str]]
         elif v.kind == TEXT_CONTAINS:
             text = result.stdout_text()
             line = _find_field_line(text, v.field)
-            passed = line is not None and v.value in line
-            message = f'"{v.field}" contains "{v.value}"'
+            passed = line is not None and value in line
+            message = f'"{v.field}" contains "{value}"'
             if line is None:
                 message += " (field not found in output)"
 
@@ -116,3 +131,15 @@ def validate(test_case: TestCase, results: List) -> Tuple[List[Tuple[bool, str]]
         validation_lines.append((passed, message))
 
     return validation_lines, all_passed
+
+
+class Validator:
+    """Thin class wrapper around validate(), holding an optional
+    VariableManager so callers don't have to pass it on every call."""
+
+    def __init__(self, variable_manager=None):
+        self.variable_manager = variable_manager
+
+    def validate(self, test_case: TestCase, results: List) -> Tuple[List[ValidationResult], bool]:
+        raw_lines, all_passed = validate(test_case, results, self.variable_manager)
+        return [ValidationResult(passed=p, message=m) for p, m in raw_lines], all_passed

@@ -1,0 +1,10 @@
+# Intentionally references a variable that does not exist in
+# common_variables.json, to verify missing-variable handling produces a
+# clear ERROR (no command executed, no .log written).
+TEST "Missing Variable Example"
+
+RUN "echo {{not_a_real_variable}}"
+
+EXPECT_EXIT 0
+
+END

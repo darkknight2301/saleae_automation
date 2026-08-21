@@ -28,6 +28,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from .utility import parse_int_maybe_hex
+
 
 class ParseError(Exception):
     """Raised for any structurally or syntactically invalid .nvtest file.
@@ -107,7 +109,7 @@ def _split_tokens(line: str, line_no: int) -> List[str]:
 
 def _parse_int_maybe_hex(token: str, line_no: int, line: str, what: str) -> int:
     try:
-        return int(token, 0) if token.lower().startswith("0x") else int(token)
+        return parse_int_maybe_hex(token)
     except ValueError:
         raise ParseError(f"expected an integer for {what}, got {token!r}", line_no, line)
 
@@ -271,3 +273,15 @@ def parse_file(path: str) -> TestCase:
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     return parse_text(text, source_path=path)
+
+
+class TestParser:
+    """Thin class wrapper around parse_file()/parse_text(). Parsing logic
+    itself is unchanged; this exists so TestRunner depends on an object,
+    not a bare module function."""
+
+    def parse(self, path: str) -> TestCase:
+        return parse_file(path)
+
+    def parse_text(self, text: str, source_path: str = None) -> TestCase:
+        return parse_text(text, source_path=source_path)

@@ -12,26 +12,24 @@ Rules enforced here (per Phase 1 spec):
 """
 
 import os
-from datetime import datetime
+import time
 
-BYTES_PER_LINE = 16
+from .utility import hex_dump as _hex_dump, safe_filename, format_timestamp
 
 
-def _hex_dump(data: bytes, bytes_per_line: int = BYTES_PER_LINE) -> str:
-    """Render bytes as a classic hexdump -C style dump:
-    OFFSET  HEX BYTES...  |ascii|
-    """
-    if not data:
-        return "(0 bytes)"
+def _resolve_log_path(log_dir: str, test_name: str, log_path: str = None) -> str:
+    """Default log path: <log_dir>/<safe test name>.log, unless overridden."""
+    if log_path is not None:
+        return log_path
+    return os.path.join(log_dir, f"{safe_filename(test_name)}.log")
 
-    lines = []
-    for offset in range(0, len(data), bytes_per_line):
-        chunk = data[offset:offset + bytes_per_line]
-        hex_part = " ".join(f"{b:02x}" for b in chunk)
-        hex_part = hex_part.ljust(bytes_per_line * 3 - 1)
-        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-        lines.append(f"{offset:08x}  {hex_part}  {ascii_part}")
-    return "\n".join(lines)
+
+def _header(test_name: str, start_str: str):
+    return ["=" * 40, f"TEST: {test_name}", f"START: {start_str}", "=" * 40, ""]
+
+
+def _footer(result_status: str, end_str: str):
+    return ["", "RESULT:", result_status, "", f"END: {end_str}", "=" * 40]
 
 
 def _render_command_block(result, binary_output: bool):
@@ -65,8 +63,10 @@ def _render_command_block(result, binary_output: bool):
     return lines
 
 
-class Logger:
-    """Formats a CommandResult into the standard test log and writes it to disk."""
+class ResultLogger:
+    """Formats a CommandResult into the standard test log and writes it to
+    disk, inside one run directory shared by every test in the same
+    framework execution (logs/{run_id}/<test>.log)."""
 
     def __init__(self, log_dir: str = "logs"):
         self.log_dir = log_dir
@@ -100,31 +100,17 @@ class Logger:
         if result_status is None:
             result_status = "PASS" if result.exit_code == 0 else "FAIL"
 
-        start_str = datetime.fromtimestamp(result.start_time).strftime("%Y-%m-%d %H:%M:%S")
-        end_str = datetime.fromtimestamp(result.end_time).strftime("%Y-%m-%d %H:%M:%S")
+        start_str = format_timestamp(result.start_time)
+        end_str = format_timestamp(result.end_time)
 
-        lines = []
-        lines.append("=" * 40)
-        lines.append(f"TEST: {test_name}")
-        lines.append(f"START: {start_str}")
-        lines.append("=" * 40)
-        lines.append("")
+        lines = _header(test_name, start_str)
         # stderr section (if any) is included automatically by the shared
         # block renderer, keeping clean-run logs matching the spec template.
         lines.extend(_render_command_block(result, binary_output))
-
-        lines.append("")
-        lines.append("RESULT:")
-        lines.append(result_status)
-        lines.append("")
-        lines.append(f"END: {end_str}")
-        lines.append("=" * 40)
+        lines.extend(_footer(result_status, end_str))
 
         content = "\n".join(lines) + "\n"
-
-        if log_path is None:
-            safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in test_name)
-            log_path = os.path.join(self.log_dir, f"{safe_name}.log")
+        log_path = _resolve_log_path(self.log_dir, test_name, log_path)
 
         with open(log_path, "w", encoding="utf-8", errors="replace") as f:
             f.write(content)
@@ -139,6 +125,7 @@ class Logger:
         validation_lines,
         result_status: str,
         log_path: str = None,
+        filename_stem: str = None,
     ) -> str:
         """Write a single .log file for a `.nvtest` test case (Phase 2).
 
@@ -149,7 +136,8 @@ class Logger:
         hex_dump as Phase 1 for consistency.
 
         Args:
-            test_name:        name shown in the TEST: header / filename.
+            test_name:        name shown in the TEST: header (free text,
+                                from the .nvtest file's TEST "..." line).
             results:           list of CommandResult, one per RUN, in order.
             binary_flags:      list of bool, same length as results; True
                                 means that command's output is rendered as a
@@ -160,25 +148,28 @@ class Logger:
             result_status:     overall "PASS"/"FAIL" for the test case (a
                                 single failed validation must make this FAIL
                                 -- decided by the validator, not this class).
-            log_path:          explicit output path. Defaults to
-                                <log_dir>/<test_name>.log
+            log_path:          explicit output path; overrides everything
+                                below if given.
+            filename_stem:     filename (no extension) to use for the
+                                default log_path, e.g. the source .nvtest
+                                file's basename. Two different .nvtest files
+                                can declare the same free-text TEST name, so
+                                the filename is keyed off the source file,
+                                not test_name (review F-2: using test_name
+                                for the filename let two unrelated files
+                                silently overwrite each other's .log).
+                                Falls back to test_name if not given, for
+                                callers with no source file (e.g. ad hoc use).
 
         Returns:
             The path of the log file written.
         """
         assert len(results) == len(binary_flags), "results/binary_flags length mismatch"
 
-        start_str = datetime.fromtimestamp(results[0].start_time).strftime("%Y-%m-%d %H:%M:%S") \
-            if results else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        end_str = datetime.fromtimestamp(results[-1].end_time).strftime("%Y-%m-%d %H:%M:%S") \
-            if results else start_str
+        start_str = format_timestamp(results[0].start_time) if results else format_timestamp(time.time())
+        end_str = format_timestamp(results[-1].end_time) if results else start_str
 
-        lines = []
-        lines.append("=" * 40)
-        lines.append(f"TEST: {test_name}")
-        lines.append(f"START: {start_str}")
-        lines.append("=" * 40)
-        lines.append("")
+        lines = _header(test_name, start_str)
 
         for i, result in enumerate(results):
             lines.extend(_render_command_block(result, binary_flags[i]))
@@ -189,21 +180,17 @@ class Logger:
             lines.extend(validation_lines)
         else:
             lines.append("(no validations declared)")
-        lines.append("")
 
-        lines.append("RESULT:")
-        lines.append(result_status)
-        lines.append("")
-        lines.append(f"END: {end_str}")
-        lines.append("=" * 40)
+        lines.extend(_footer(result_status, end_str))
 
         content = "\n".join(lines) + "\n"
-
-        if log_path is None:
-            safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in test_name)
-            log_path = os.path.join(self.log_dir, f"{safe_name}.log")
+        log_path = _resolve_log_path(self.log_dir, filename_stem or test_name, log_path)
 
         with open(log_path, "w", encoding="utf-8", errors="replace") as f:
             f.write(content)
 
         return log_path
+
+
+# Backward-compat alias (Logger was renamed to ResultLogger).
+Logger = ResultLogger

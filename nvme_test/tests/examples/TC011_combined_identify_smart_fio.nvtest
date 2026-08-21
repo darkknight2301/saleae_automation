@@ -1,0 +1,32 @@
+# !!! DESTRUCTIVE - the final fio step writes directly to a raw block
+# device and WILL destroy any data/filesystem on {{device}} !!!
+# Requires: nvme-cli + fio installed, a real NVMe namespace at {{device}},
+# and explicit confirmation this device is safe to overwrite.
+#
+# Combined-automation Example 3: identify -> smart-log -> Linux check ->
+# fio. Demonstrates a full NVMe + Linux + FIO chain in one .nvtest, with
+# each EXPECT bound to its nearest preceding RUN. The framework's own
+# verification never executes this file automatically -- run it
+# explicitly and deliberately:
+#     python3 run.py tests/examples/TC011_combined_identify_smart_fio.nvtest
+TEST "Combined Example 3 - Identify + SMART + FIO (DESTRUCTIVE)"
+
+RUN "nvme id-ctrl {{device}}"
+
+EXPECT_EXIT 0
+EXPECT "Firmware Revision" NOT_EMPTY
+
+RUN "nvme smart-log {{device}}"
+
+EXPECT_EXIT 0
+EXPECT "critical_warning" CONTAINS "0"
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+
+RUN "fio --name=combined_write --filename={{device}} --rw=randwrite --bs=4k --size=256M --numjobs=1 --direct=1"
+
+EXPECT_EXIT 0
+
+END
