@@ -1,0 +1,21 @@
+TEST "Combined Example 3 - Identify + SMART + FIO (DESTRUCTIVE)"
+
+RUN "nvme id-ctrl {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "Firmware Revision" NOT_EMPTY
+
+RUN "nvme smart-log {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "critical_warning" CONTAINS "0"
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+
+RUN "fio --name=combined_write --filename={{device0}} --rw=randwrite --bs=4k --size=256M --numjobs=1 --direct=1"
+
+EXPECT_EXIT 0
+
+END

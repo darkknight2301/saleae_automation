@@ -1,0 +1,8 @@
+TEST "Identify Controller"
+
+RUN "nvme id-ctrl /dev/nvme0"
+
+EXPECT_EXIT 0
+EXPECT "Firmware Revision" NOT_EMPTY
+
+END

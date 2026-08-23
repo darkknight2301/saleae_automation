@@ -309,7 +309,7 @@ def variable_manager_loads_and_substitutes():
 
     vm = VariableManager("common_variables.json")
     assert vm.get("device") == "/dev/nvme0"
-    assert vm.substitute("nvme id-ctrl {{device}}") == "nvme id-ctrl /dev/nvme0"
+    assert vm.substitute("nvme id-ctrl {{device0}}") == "nvme id-ctrl /dev/nvme0"
     try:
         vm.get("does_not_exist")
         raise AssertionError("expected VariableError for missing variable")
@@ -319,7 +319,7 @@ def variable_manager_loads_and_substitutes():
 
 
 def variable_substitution_end_to_end():
-    """A .nvtest using {{device}} resolves and runs through TestRunner."""
+    """A .nvtest using {{device0}} resolves and runs through TestRunner."""
 
     test_runner = TestRunner(config=ConfigManager())
     result = test_runner.run("tests/TC007_variable_substitution.nvtest")

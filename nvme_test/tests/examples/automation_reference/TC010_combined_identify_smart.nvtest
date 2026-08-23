@@ -1,0 +1,13 @@
+TEST "Combined Example 2 - Identify + SMART"
+
+RUN "nvme id-ctrl {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "Firmware Revision" NOT_EMPTY
+
+RUN "nvme smart-log {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "critical_warning" CONTAINS "0"
+
+END

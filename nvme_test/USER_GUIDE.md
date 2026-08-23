@@ -1,4 +1,4 @@
-# NVMe/FIO Test Automation Framework — User Guide
+# NVMe Test Automation Framework — User Guide
 
 This guide is for a **test engineer/test author** using the framework to write and run
 `.nvtest` test cases. It documents the framework exactly as implemented — every syntax
@@ -14,7 +14,7 @@ against a device, checks their output/exit code/raw bytes against expectations w
 small text format called `.nvtest`, and writes one human-readable `.log` file per test.
 
 There is exactly one execution engine for every command — `nvme id-ctrl`, `fio ...`, and
-`lsblk` are all just "a command" to the framework. Nothing is NVMe- or fio-specific at the
+`lsblk` are all just "a command" to the framework. Nothing is NVMe or fio or Linux command specific at the
 execution layer.
 
 ```
@@ -42,9 +42,7 @@ PASS / FAIL        (a single failed validation makes the whole test FAIL)
 **Supported tools:** `nvme-cli`, `fio`, and any Linux command (`lsblk`, `lspci`, etc.) — the
 framework runs whatever string you put after `RUN`, via the shell.
 
-**Environment:** built and verified against Ubuntu 20.04 / Python 3.8, though this
-documentation was also verified running under a newer Python 3 (3.12) in the environment used
-to write it — the code contains no version-specific syntax beyond 3.8.
+**Environment:** built and verified against Ubuntu 20.04 / Python 3.8, though this can be used on any linux machine assuming required dependency are installed.
 
 **Python's role:** Python only implements the framework itself. You never write `.py` test
 files — `.nvtest` is the only test-case format the framework will execute.
@@ -54,8 +52,6 @@ files — `.nvtest` is the only test-case format the framework will execute.
 ## 2. Prerequisites
 
 - **Python 3.8+** (standard library only, plus one third-party dependency: PyYAML)
-- **PyYAML** — required only if you pass `--config` to load a YAML file; without `--config`
-  the framework runs entirely on built-in defaults with no PyYAML import failure.
 - **`nvme-cli`** — required for any `.nvtest` file that runs `nvme ...` commands.
 - **`fio`** — required for any `.nvtest` file that runs `fio ...` commands.
 - **A real NVMe device** — only required for `.nvtest` files that target one (e.g.
@@ -81,15 +77,15 @@ pip show pyyaml     # only needed if you plan to use --config
 
 The framework is a plain directory of Python files — there is no packaging/installer step.
 
-1. **Obtain the framework** — unzip/copy the project directory (containing `run.py`,
+1. **Obtain the framework** — Copy the project directory (containing `run.py`,
    `framework/`, `tests/`, `config/`, `common_variables.json`, `requirements.txt`) to your
    machine.
-2. **Install the one dependency** (only needed if you plan to use `--config`):
+2. **Install the one dependency**:
    ```bash
    pip install -r requirements.txt
    ```
 3. **Directory preparation** — none required. `logs/` is created automatically on first run.
-4. **Configuration setup** — optional. `config/config.yaml` ships as a template; see
+4. **Configuration setup** — `config/config.yaml` ships as a template; see
    Section 8 for whether/how to activate it.
 5. **Initial verification** — run the framework's own built-in self-check with no arguments:
    ```bash
@@ -102,7 +98,7 @@ The framework is a plain directory of Python files — there is no packaging/ins
    in scripts.
 6. **Run your first real test:**
    ```bash
-   python3 run.py tests/TC001_success.nvtest
+   python3 run.py tests/examples/syntax_reference/TC001_success.nvtest
    ```
    Expected output:
    ```
@@ -120,7 +116,7 @@ The framework is a plain directory of Python files — there is no packaging/ins
 ```
 nvme_test/
 ├── run.py                      # CLI entry point (and internal self-verification, see Sec 14)
-├── requirements.txt             # PyYAML>=6.0 (only needed for --config)
+├── requirements.txt             # PyYAML>=6.0
 ├── common_variables.json        # shared {{variable}} values -- edit this
 ├── config/
 │   └── config.yaml               # optional config template -- edit this, see Sec 8
@@ -129,15 +125,14 @@ nvme_test/
 │   │   framework_log.py, config_manager.py, variable_manager.py,
 │   │   utility.py, cli.py
 ├── tests/                        # your .nvtest files go here (any subdirectory layout)
-│   └── examples/                 # shipped realistic NVMe/FIO/passthru examples
+│   └── examples/                 # Realistic NVMe/FIO/passthru examples
 └── logs/                         # created automatically; one logs/{timestamp}/ per run
 ```
 
 **What you will normally edit:** `.nvtest` files under `tests/`, `common_variables.json`, and
 optionally `config/config.yaml`.
 
-**What you normally should not edit:** anything under `framework/` -- that's covered in the
-Developer Guide.
+**What you normally should not edit:** anything under `framework/`
 
 ---
 
@@ -147,7 +142,7 @@ Developer Guide.
 > outright -- a directory scan silently skips everything that isn't `*.nvtest`, and passing a
 > non-`.nvtest` file path directly is refused with an explicit error before anything runs.
 
-The format is a small, line-oriented DSL. One statement per line. Blank lines are ignored.
+The format is a small, line-oriented DSL (Domain-Specific Language). One statement per line. Blank lines are ignored.
 Lines whose first non-whitespace character is `#` are comments and are ignored too (useful for
 documenting prerequisites inside a test file).
 
@@ -198,7 +193,7 @@ Minimal test:
 ```text
 TEST "NVMe Identify Controller"
 
-RUN "nvme id-ctrl {{device}}"
+RUN "nvme id-ctrl {{device0}}"
 
 EXPECT_EXIT 0
 
@@ -207,30 +202,23 @@ END
 
 Line by line:
 - `TEST "NVMe Identify Controller"` -- names this test case; shown in the log's header.
-- `RUN "nvme id-ctrl {{device}}"` -- runs `nvme id-ctrl /dev/nvme0` (after `{{device}}` is
+- `RUN "nvme id-ctrl {{device0}}"` -- runs `nvme id-ctrl /dev/nvme0` (after `{{device0}}` is
   substituted from `common_variables.json` -- see Section 7).
 - `EXPECT_EXIT 0` -- the command's exit code must be `0`.
 - `END` -- marks the end of the file; nothing may follow.
 
-> **Note on syntax:** the framework's actual variable placeholder syntax is `{{device}}`
-> (double curly braces), **not** `${device}`. This is a deliberate implementation choice:
-> `RUN` commands are executed via the shell, and `${...}` is live POSIX shell
-> parameter-expansion syntax -- using it as a placeholder would collide with any legitimate
-> shell variable a test author might write. See `framework/variable_manager.py`'s module
-> docstring for the full rationale. Every example in this guide uses the actual `{{...}}`
-> syntax.
 
 A more realistic test with multiple validations (this is the actual shipped
-`tests/TC001_success.nvtest`, using a `printf` mock in place of real hardware so it runs
+`tests/examples/syntax_reference/TC001_success.nvtest`, using a `printf` mock in place of real hardware so it runs
 anywhere):
 
 ```text
 TEST "Mock Identify Controller - Successful Validation"
 
-RUN "printf 'Model Number   : Samsung SSD 970 EVO\nFirmware Revision : 2B2QEXM7\n'"
+RUN "printf 'Model Number   : KIOXIA SSD CM7\nFirmware Revision : 2B2QEXM7\n'"
 
 EXPECT_EXIT 0
-EXPECT "Model Number" CONTAINS "Samsung"
+EXPECT "Model Number" CONTAINS "KIOXIA"
 EXPECT "Firmware Revision" NOT_EMPTY
 EXPECT "ERROR" NOT_CONTAINS
 
@@ -240,7 +228,7 @@ END
 Running it:
 
 ```bash
-$ python3 run.py tests/TC001_success.nvtest
+$ python3 run.py tests/examples/syntax_reference/TC001_success.nvtest
 TC001_success    PASS
 
 Total: 1
@@ -257,7 +245,7 @@ Failed: 0
 ```json
 {
     "device": "/dev/nvme0",
-    "expected_model": "Samsung",
+    "expected_model": "KIOXIA",
     "expected_fw": "ABC123",
     "min_iops": 100000
 }
@@ -267,7 +255,7 @@ Failed: 0
   parse as a JSON object (not a list or scalar) -- `VariableManager.load()` raises
   `ValueError` otherwise.
 - **Referencing variables:** write `{{name}}` anywhere inside a `RUN` command string or inside
-  an `EXPECT "<field>" CONTAINS "<value>"` value. Example: `RUN "nvme id-ctrl {{device}}"`,
+  an `EXPECT "<field>" CONTAINS "<value>"` value. Example: `RUN "nvme id-ctrl {{device0}}"`,
   `EXPECT "Model Number" CONTAINS "{{expected_model}}"`.
 - **Command substitution:** every `RUN` command has `{{...}}` placeholders resolved before the
   command is executed.
@@ -353,10 +341,10 @@ or any other Linux command.
 ### NVMe
 ```text
 RUN "nvme list"
-RUN "nvme id-ctrl {{device}}"
-RUN "nvme smart-log {{device}}"
-RUN "nvme admin-passthru {{device}} --opcode=0x06 --cdw10=1 --data-len=4096 --read --raw-binary"
-RUN "nvme io-passthru {{device}} --opcode=0x02 --namespace-id=1 --data-len=4096 --read --raw-binary"
+RUN "nvme id-ctrl {{device0}}"
+RUN "nvme smart-log {{device0}}"
+RUN "nvme admin-passthru {{device0}} --opcode=0x06 --cdw10=1 --data-len=4096 --read --raw-binary"
+RUN "nvme io-passthru {{device0}} --opcode=0x02 --namespace-id=1 --data-len=4096 --read --raw-binary"
 ```
 
 ### Linux
@@ -388,13 +376,13 @@ RUN "fio --name=safe_smoke --filename=/tmp/test.bin --size=4M --rw=write --bs=4k
 
 A single `.nvtest` file can chain any number of `RUN` steps across different tools -- NVMe,
 Linux, and FIO -- with each step's own validations. This is a real, verified capability, not
-aspirational. Actual shipped example (`tests/TC008_combined_safe.nvtest`, using safe/mock
+aspirational. Actual shipped example (`tests/examples/syntax_reference/TC008_combined_safe.nvtest`, using safe/mock
 commands so it runs without hardware):
 
 ```text
 TEST "Combined Mock NVMe Health Check"
 
-RUN "printf 'Model Number   : {{expected_model}} SSD 970 EVO\nFirmware Revision : {{expected_fw}}\n'"
+RUN "printf 'Model Number   : {{expected_model}} CM7\nFirmware Revision : {{expected_fw}}\n'"
 
 EXPECT_EXIT 0
 EXPECT "Model Number" CONTAINS "{{expected_model}}"
@@ -431,7 +419,7 @@ END
   the first failure.
 
 A realistic identify -> SMART -> FIO example targeting real hardware (shipped as
-`tests/examples/TC011_combined_identify_smart_fio.nvtest`, marked destructive because its
+`tests/examples/automation_reference/TC011_combined_identify_smart_fio.nvtest`, marked destructive because its
 `fio` step writes to a raw device) shows the same pattern with real `nvme`/`fio` commands
 instead of mocks.
 
@@ -446,7 +434,7 @@ expressible directly, without any external shell scripting.
 
 **`LOOP <n>` -- run a command repeatedly:**
 ```text
-RUN "nvme id-ctrl {{device}}" LOOP 1000
+RUN "nvme id-ctrl {{device0}}" LOOP 1000
 
 EXPECT_EXIT 0
 ```
@@ -470,7 +458,7 @@ END_PARALLEL
 END
 ```
 (this is the actual shipped `tests/TC011_parallel_stress.nvtest`; the real-hardware version is
-`tests/examples/TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest`, using real `nvme
+`tests/examples/automation_reference/TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest`, using real `nvme
 id-ctrl`/`nvme reset` in place of `echo`)
 
 - Every `RUN` directly inside a `PARALLEL` block executes in its **own thread**, concurrently
@@ -536,14 +524,14 @@ to `EXPECT` (`CONTAINS "<value>"` / `NOT_CONTAINS` / `NOT_EMPTY`):
 ```text
 TEST "Negative Test - Invalid Field on Stderr"
 
-RUN "nvme id-ctrl {{device}} --this-field-does-not-exist=1"
+RUN "nvme id-ctrl {{device0}} --this-field-does-not-exist=1"
 
 EXPECT_EXIT 1
 EXPECT_STDERR "invalid" NOT_EMPTY
 
 END
 ```
-(shipped as `tests/examples/TC014_invalid_field_stderr.nvtest`; a fully mocked, no-hardware
+(shipped as `tests/examples/automation_reference/TC014_invalid_field_stderr.nvtest`; a fully mocked, no-hardware
 version demonstrating both a positive `EXPECT_STDERR` match and confirming plain `EXPECT`
 still only sees stdout is `tests/TC012_stderr_validation.nvtest`)
 
@@ -567,7 +555,7 @@ still only sees stdout is `tests/TC012_stderr_validation.nvtest`)
 | Validator | Syntax | Purpose | Matching semantics | Example |
 |---|---|---|---|---|
 | Exit code | `EXPECT_EXIT <code>` | Check the bound command's exit code | Exact integer equality | `EXPECT_EXIT 0` |
-| Contains | `EXPECT "<field>" CONTAINS "<value>"` | Check a field's value (stdout) | Finds the first line of stdout containing `<field>` as a substring, then checks that same line also contains `<value>` as a substring. Fails if no line contains `<field>` at all. | `EXPECT "Model Number" CONTAINS "Samsung"` |
+| Contains | `EXPECT "<field>" CONTAINS "<value>"` | Check a field's value (stdout) | Finds the first line of stdout containing `<field>` as a substring, then checks that same line also contains `<value>` as a substring. Fails if no line contains `<field>` at all. | `EXPECT "Model Number" CONTAINS "KIOXIA"` |
 | Not contains | `EXPECT "<field>" NOT_CONTAINS` | Assert absence (stdout) | `<field>` must not appear anywhere in the entire stdout (not line-scoped) | `EXPECT "ERROR" NOT_CONTAINS` |
 | Not empty | `EXPECT "<field>" NOT_EMPTY` | Assert a field has a value (stdout) | Finds the first line containing `<field>`, strips the field text and any leading `:`/`=` and whitespace from what follows, and checks the remainder is non-empty | `EXPECT "Firmware Revision" NOT_EMPTY` |
 | Stderr contains | `EXPECT_STDERR "<field>" CONTAINS "<value>"` | Check a field's value (stderr) | Identical semantics to Contains, applied to stderr instead of stdout | `EXPECT_STDERR "invalid" CONTAINS "invalid field"` |
@@ -612,10 +600,10 @@ nvme admin-passthru / nvme io-passthru
   Same .log file as every other test (no separate .bin file, ever)
 ```
 
-Realistic example (shipped as `tests/examples/TC007_admin_passthru_HARDWARE_REQUIRED.nvtest`):
+Realistic example (shipped as `tests/examples/automation_reference/TC007_admin_passthru_HARDWARE_REQUIRED.nvtest`):
 
 ```text
-RUN "nvme admin-passthru {{device}} --opcode=0x06 --cdw10=1 --data-len=4096 --read --raw-binary"
+RUN "nvme admin-passthru {{device0}} --opcode=0x06 --cdw10=1 --data-len=4096 --read --raw-binary"
 
 EXPECT_EXIT 0
 EXPECT_BYTE 0x00 0x00
@@ -661,7 +649,7 @@ Size: 8 bytes
 FIO commands are just `RUN` statements like anything else -- there is no FIO-specific syntax.
 
 Safe example (targets a regular file, not a device -- actually runnable, shipped as
-`tests/examples/TC005_fio_safe_smoke.nvtest`):
+`tests/examples/automation_reference/TC005_fio_safe_smoke.nvtest`):
 
 ```text
 TEST "FIO Smoke Test (file-based, safe)"
@@ -674,25 +662,25 @@ END
 ```
 
 Combining FIO with NVMe/common variables (shipped as
-`tests/examples/TC011_combined_identify_smart_fio.nvtest`):
+`tests/examples/automation_reference/TC011_combined_identify_smart_fio.nvtest`):
 
 ```text
-RUN "fio --name=combined_write --filename={{device}} --rw=randwrite --bs=4k --size=256M --numjobs=1 --direct=1"
+RUN "fio --name=combined_write --filename={{device0}} --rw=randwrite --bs=4k --size=256M --numjobs=1 --direct=1"
 
 EXPECT_EXIT 0
 ```
 
 > ### Destructive operations -- read before running against real hardware
-> Any `fio` job whose `--filename` points at a raw block device (e.g. `{{device}}` resolving
+> Any `fio` job whose `--filename` points at a raw block device (e.g. `{{device0}}` resolving
 > to `/dev/nvme0n1`) with a `--rw=write`/`--rw=randwrite`/similar mode **will destroy data and
 > any filesystem on that device**. The shipped example
-> `tests/examples/TC006_fio_write_DESTRUCTIVE.nvtest` is deliberately named and commented to
+> `tests/examples/automation_reference/TC006_fio_write_DESTRUCTIVE.nvtest` is deliberately named and commented to
 > make this unmistakable, and -- like every hardware-required/destructive example under
 > `tests/examples/` -- is never executed automatically by the framework's own
 > self-verification (`python3 run.py` with no arguments). You must run it explicitly and
 > deliberately:
 > ```bash
-> python3 run.py tests/examples/TC006_fio_write_DESTRUCTIVE.nvtest
+> python3 run.py tests/examples/automation_reference/TC006_fio_write_DESTRUCTIVE.nvtest
 > ```
 > Similarly, `nvme admin-passthru`/`nvme io-passthru` commands can modify device state
 > depending on the opcode used -- the shipped passthru examples use read-only opcodes, but the
@@ -730,7 +718,7 @@ options:
 ```
 
 **`<path>` accepts exactly one argument** -- either:
-- **A single `.nvtest` file:** `python3 run.py tests/TC001_success.nvtest`
+- **A single `.nvtest` file:** `python3 run.py tests/examples/syntax_reference/TC001_success.nvtest`
 - **A directory:** `python3 run.py tests/` -- discovers and runs only `*.nvtest` files
   directly inside it (non-recursive), sorted alphabetically. Every other file in that
   directory (`.yaml`, `.txt`, `.py`, etc.) is silently ignored -- never opened, never parsed.
@@ -754,16 +742,6 @@ directory that might contain destructive examples).
 used); `1` = at least one test failed or errored; `2` = a usage error (bad path, missing
 config file).
 
-> ### Important: `python3 run.py` with no arguments does not print usage help
-> With zero arguments, `run.py` runs the framework's own internal self-verification suite
-> (hand-written checks covering every stage of the framework's own development), not a
-> "please provide a path" message. This suite actually executes real commands, including real
-> `lsblk` and real `fio` writes to files under `/tmp` (some shipped test/example files are
-> genuinely run, not mocked). It does not touch any real NVMe hardware or run any
-> destructive/hardware-required example. This is documented behavior of the shipped `run.py`,
-> not a bug, but it means running `python3 run.py` bare is a self-test of the framework, not
-> "show me how to use this" -- always pass a path for normal test execution.
-
 ---
 
 ## 15. Logs
@@ -786,11 +764,11 @@ suffix guarantees each invocation gets its own directory even if two runs start 
 same second.
 
 **The `.log` filename is derived from the source `.nvtest` file's name**, not the free-text
-`TEST "..."` name inside it -- so `tests/TC001_success.nvtest` always produces
+`TEST "..."` name inside it -- so `tests/examples/syntax_reference/TC001_success.nvtest` always produces
 `TC001_success.log`, regardless of what its `TEST` line says.
 
 Complete real example log (`TC008_combined_safe.log`, generated by actually running
-`tests/TC008_combined_safe.nvtest`):
+`tests/examples/syntax_reference/TC008_combined_safe.nvtest`):
 
 ```
 ========================================
@@ -799,13 +777,13 @@ START: 2026-08-22 05:47:10
 ========================================
 
 COMMAND:
-printf 'Model Number   : Samsung SSD 970 EVO\nFirmware Revision : ABC123\n'
+printf 'Model Number   : KIOXIA CM7\nFirmware Revision : ABC123\n'
 
 EXIT CODE:
 0
 
 OUTPUT:
-Model Number   : Samsung SSD 970 EVO
+Model Number   : KIOXIA CM7
 Firmware Revision : ABC123
 
 
@@ -843,7 +821,7 @@ OUTPUT:
 
 VALIDATION:
 [PASS] Exit code == 0
-[PASS] "Model Number" contains "Samsung"
+[PASS] "Model Number" contains "KIOXIA"
 [PASS] "Firmware Revision" is not empty
 [PASS] Exit code == 0
 [PASS] "critical_warning" contains "0"
@@ -870,7 +848,7 @@ END: 2026-08-22 05:47:12
 
 ## 16. PASS / FAIL Behavior
 
-Real `FAIL` example (`tests/TC002_failed_validation.nvtest` actually run):
+Real `FAIL` example (`tests/examples/syntax_reference/TC002_failed_validation.nvtest` actually run):
 ```
 COMMAND:
 printf 'Model Number   : Kioxia KXG60ZNV\nFirmware Revision : 1A1AEXM2\n'
@@ -880,7 +858,7 @@ EXIT CODE:
 
 VALIDATION:
 [PASS] Exit code == 0
-[FAIL] "Model Number" contains "Samsung"
+[FAIL] "Model Number" contains "KIOXIA"
 [PASS] "Firmware Revision" is not empty
 [PASS] "ERROR" not present in output
 
@@ -910,18 +888,18 @@ HARDWARE / DESTRUCTIVE):
 
 | # | Pattern | Shipped file |
 |---|---|---|
-| 1 | Identify Controller | `tests/examples/TC001_nvme_list.nvtest` (SAFE), `tests/examples/TC002_identify_ctrl.nvtest` (NEEDS HARDWARE) |
-| 2 | SMART Log | `tests/examples/TC003_smartlog.nvtest` (NEEDS HARDWARE) |
-| 3 | Namespace/device check | `tests/examples/TC004_check_nvme_device.nvtest` (SAFE, uses `lsblk`) |
-| 4 | Linux environment check | `tests/examples/TC004_check_nvme_device.nvtest` (SAFE) |
-| 5 | FIO | `tests/examples/TC005_fio_safe_smoke.nvtest` (SAFE), `TC006_fio_write_DESTRUCTIVE.nvtest` (DESTRUCTIVE) |
-| 6 | Identify + SMART | `tests/examples/TC010_combined_identify_smart.nvtest` (NEEDS HARDWARE) |
-| 7 | Identify + SMART + FIO | `tests/examples/TC011_combined_identify_smart_fio.nvtest` (DESTRUCTIVE), `tests/TC008_combined_safe.nvtest` (SAFE mock equivalent) |
-| 8 | Admin passthru | `tests/examples/TC007_admin_passthru_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
-| 9 | IO passthru | `tests/examples/TC008_io_passthru_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
-| 10 | Variable-driven validation | `tests/TC007_variable_substitution.nvtest` (SAFE), `tests/examples/TC009_combined_identify.nvtest` (NEEDS HARDWARE) |
-| 11 | Concurrent loop/stress (LOOP + PARALLEL) | `tests/TC010_loop_sequential.nvtest`, `tests/TC011_parallel_stress.nvtest` (both SAFE), `tests/examples/TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
-| 12 | Negative test / expected failure (EXPECT_STDERR) | `tests/TC012_stderr_validation.nvtest` (SAFE), `tests/examples/TC014_invalid_field_stderr.nvtest` (NEEDS nvme-cli) |
+| 1 | Identify Controller | `tests/examples/syntax_reference/TC001_nvme_list.nvtest` (SAFE), `tests/examples/automation_reference/TC002_identify_ctrl.nvtest` (NEEDS HARDWARE) |
+| 2 | SMART Log | `tests/examples/automation_reference/TC003_smartlog.nvtest` (NEEDS HARDWARE) |
+| 3 | Namespace/device check | `tests/examples/automation_reference/TC004_check_nvme_device.nvtest` (SAFE, uses `lsblk`) |
+| 4 | Linux environment check | `tests/examples/automation_reference/TC004_check_nvme_device.nvtest` (SAFE) |
+| 5 | FIO | `tests/examples/automation_reference/TC005_fio_safe_smoke.nvtest` (SAFE), `TC006_fio_write_DESTRUCTIVE.nvtest` (DESTRUCTIVE) |
+| 6 | Identify + SMART | `tests/examples/automation_reference/TC010_combined_identify_smart.nvtest` (NEEDS HARDWARE) |
+| 7 | Identify + SMART + FIO | `tests/examples/automation_reference/TC011_combined_identify_smart_fio.nvtest` (DESTRUCTIVE), `tests/TC008_combined_safe.nvtest` (SAFE mock equivalent) |
+| 8 | Admin passthru | `tests/examples/automation_reference/TC007_admin_passthru_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
+| 9 | IO passthru | `tests/examples/automation_reference/TC008_io_passthru_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
+| 10 | Variable-driven validation | `tests/examples/syntax_reference/TC007_variable_substitution.nvtest` (SAFE), `tests/examples/automation_reference/TC009_combined_identify.nvtest` (NEEDS HARDWARE) |
+| 11 | Concurrent loop/stress (LOOP + PARALLEL) | `ttests/examples/syntax_reference/TC010_loop_sequential.nvtest`, `tests/TC011_parallel_stress.nvtest` (both SAFE), `tests/examples/automation_reference/TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest` (NEEDS HARDWARE) |
+| 12 | Negative test / expected failure (EXPECT_STDERR) | `tests/TC012_stderr_validation.nvtest` (SAFE), `ttests/examples/automation_reference/TC014_invalid_field_stderr.nvtest` (NEEDS nvme-cli) |
 
 Every hardware-required/destructive file has an in-file comment stating its exact requirement
 or destructive nature, and none of them are executed by the framework's own

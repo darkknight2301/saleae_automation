@@ -1,6 +1,7 @@
 {
-    "device": "/dev/nvme0",
-    "expected_model": "Samsung",
+    "device0": "/dev/nvme0",
+    "device1": "/dev/nvme0",
+    "expected_model": "KIOXIA",
     "expected_fw": "ABC123",
     "min_iops": 100000
 }

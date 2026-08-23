@@ -1,9 +1,9 @@
 TEST "Mock Identify Controller - Successful Validation"
 
-RUN "printf 'Model Number   : Samsung SSD 970 EVO\nFirmware Revision : 2B2QEXM7\n'"
+RUN "printf 'Model Number   : KIOXIA CM7\nFirmware Revision : 2B2QEXM7\n'"
 
 EXPECT_EXIT 0
-EXPECT "Model Number" CONTAINS "Samsung"
+EXPECT "Model Number" CONTAINS "KIOXIA"
 EXPECT "Firmware Revision" NOT_EMPTY
 EXPECT "ERROR" NOT_CONTAINS
 

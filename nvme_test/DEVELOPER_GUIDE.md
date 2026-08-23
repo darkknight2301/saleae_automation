@@ -1,6 +1,6 @@
-# NVMe/FIO Test Automation Framework — Developer Guide
+# NVMe Test Automation Framework — Developer Guide
 
-This guide is for engineers maintaining, debugging, or extending the framework. All class
+This guide is for maintaining, debugging, or extending the framework. All class
 names, method names, file paths, and behavior described here were verified directly against
 the source in `framework/` and `run.py`, and by actually executing the code shown.
 
@@ -82,14 +82,6 @@ run.py
 | `Utility` (module, not a class) | `hex_dump`, `safe_filename`, `format_timestamp`, `new_run_id`, `parse_int_maybe_hex` |
 | `CliTarget` | One resolved file path + its CLI display label |
 
-**Design decisions worth knowing:**
-- `Executor` and `Logger` still exist as **backward-compatible aliases** (`Executor =
-  CommandExecutor` in `executor.py`; `Logger = ResultLogger` in `logger.py`) from earlier
-  naming. New code should use `CommandExecutor`/`ResultLogger` directly.
-- There is a module-level `validate()` function in `validator.py` in addition to the
-  `Validator` class; `Validator.validate()` is a thin wrapper delegating to it. This is
-  acknowledged, low-priority duplication (documented technical debt, not a bug) rather than an
-  oversight — see Section 24.
 
 ---
 
@@ -98,12 +90,12 @@ run.py
 ```
 nvme_test/
 ├── run.py                       # CLI entry point + internal self-verification harness
-├── requirements.txt              # PyYAML>=6.0
-├── common_variables.json         # shipped default variables file
+├── requirements.txt              # Python dependencies
+├── common_variables.json         # Default variables file
 ├── config/
-│   └── config.yaml                # shipped config template (NOT auto-loaded, see cli.py)
+│   └── config.yaml                # Config template
 ├── framework/
-│   ├── __init__.py                # empty
+│   ├── __init__.py                # Init.
 │   ├── parser.py                   # ParseError, Validation, TestCase, TestParser, parse_text/parse_file
 │   ├── validator.py                 # ValidationResult, validate(), Validator
 │   ├── executor.py                  # CommandResult, CommandExecutor (alias: Executor)
@@ -521,7 +513,7 @@ files afterward.
   finer-grained control than `validate()`'s "one CommandResult per command" shape provides.
 - **`describe_validation(v, variable_manager=None) -> str`** — a human-readable label for a
   `Validation` with no `CommandResult` involved at all (e.g. `'Exit code == 0'`, `'"Model
-  Number" contains "Samsung"'`). Used only by `TestRunner.run()` to build the aggregate
+  Number" contains "KIOXIA"'`). Used only by `TestRunner.run()` to build the aggregate
   `"<label> across N iterations: X passed, Y failed"` message for a `LOOP > 1` `RUN` — there's
   no single `CommandResult` to hand `check_validation()` for "the whole loop," so the label and
   the pass/fail counts are assembled separately. Deliberately duplicates the small "base

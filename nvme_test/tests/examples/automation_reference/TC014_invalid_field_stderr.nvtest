@@ -1,0 +1,8 @@
+TEST "Identify Controller - Invalid Field (real nvme-cli)"
+
+RUN "nvme id-ctrl {{device0}} --this-field-does-not-exist=1"
+
+EXPECT_EXIT 1
+EXPECT_STDERR "invalid" NOT_EMPTY
+
+END

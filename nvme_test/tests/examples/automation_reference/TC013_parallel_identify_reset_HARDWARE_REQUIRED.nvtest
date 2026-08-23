@@ -1,0 +1,11 @@
+TEST "Concurrent Identify + Reset Stress (real hardware)"
+
+PARALLEL
+RUN "nvme id-ctrl {{device0}}" LOOP 1000
+EXPECT_EXIT 0
+
+RUN "nvme reset {{device0}}" LOOP 100
+EXPECT_EXIT 0
+END_PARALLEL
+
+END

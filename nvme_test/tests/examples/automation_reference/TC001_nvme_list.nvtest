@@ -1,0 +1,7 @@
+TEST "NVMe List"
+
+RUN "nvme list"
+
+EXPECT_EXIT 0
+
+END

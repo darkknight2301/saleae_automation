@@ -1,0 +1,7 @@
+TEST "SMART Log"
+
+RUN "nvme smart-log /dev/nvme0"
+
+EXPECT_EXIT 0
+
+END

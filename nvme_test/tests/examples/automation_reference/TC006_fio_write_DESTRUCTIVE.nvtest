@@ -1,0 +1,7 @@
+TEST "FIO Sequential Write (DESTRUCTIVE - real block device)"
+
+RUN "fio --name=seq_write --filename=/dev/nvme0n1 --rw=write --bs=128k --size=1G --numjobs=1 --direct=1"
+
+EXPECT_EXIT 0
+
+END

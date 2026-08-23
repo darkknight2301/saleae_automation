@@ -20,7 +20,7 @@ first validating its values; a value containing shell metacharacters
 (`, $(), ;, |) would execute as part of the RUN command. Escaping every
 substituted value automatically (e.g. shlex.quote()) was considered and
 rejected: it would break the common, legitimate case of a variable
-expanding to a bare, unquoted path (e.g. {{device}} -> /dev/nvme0).
+expanding to a bare, unquoted path (e.g. {{device0}} -> /dev/nvme0).
 """
 
 import json

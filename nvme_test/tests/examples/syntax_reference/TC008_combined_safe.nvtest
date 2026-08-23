@@ -1,0 +1,22 @@
+TEST "Combined Mock NVMe Health Check"
+
+RUN "printf 'Model Number   : {{expected_model}} CM7\nFirmware Revision : {{expected_fw}}\n'"
+
+EXPECT_EXIT 0
+EXPECT "Model Number" CONTAINS "{{expected_model}}"
+EXPECT "Firmware Revision" NOT_EMPTY
+
+RUN "printf 'critical_warning : 0\ntemperature : 35C\n'"
+
+EXPECT_EXIT 0
+EXPECT "critical_warning" CONTAINS "0"
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+
+RUN "fio --name=mock_combined --filename=/tmp/nvme_test_combined_fio.bin --size=4M --rw=write --bs=4k --numjobs=1 --minimal"
+
+EXPECT_EXIT 0
+
+END

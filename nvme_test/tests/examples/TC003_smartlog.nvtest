@@ -1,9 +1,0 @@
-# Requires: nvme-cli installed AND a real NVMe controller at /dev/nvme0.
-# Read-only command; safe on real hardware.
-TEST "SMART Log"
-
-RUN "nvme smart-log /dev/nvme0"
-
-EXPECT_EXIT 0
-
-END

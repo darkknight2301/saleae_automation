@@ -1,0 +1,9 @@
+TEST "Combined Example 1 - Identify"
+
+RUN "nvme id-ctrl {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "Firmware Revision" NOT_EMPTY
+EXPECT "Model Number" CONTAINS "{{expected_model}}"
+
+END

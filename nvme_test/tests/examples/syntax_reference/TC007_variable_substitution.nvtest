@@ -1,0 +1,8 @@
+TEST "Variable Substitution"
+
+RUN "echo Target device is {{device0}}"
+
+EXPECT_EXIT 0
+EXPECT "Target device" CONTAINS "{{device0}}"
+
+END

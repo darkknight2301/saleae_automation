@@ -1,0 +1,10 @@
+TEST "IO Passthru - Read LBA 0 (raw bytes)"
+
+RUN "nvme io-passthru /dev/nvme0n1 --opcode=0x02 --namespace-id=1 --cdw10=0 --cdw12=0 --data-len=4096 --read --raw-binary"
+
+EXPECT_EXIT 0
+# Validate the first 8 bytes read back from LBA 0 against a known-good hex
+# signature. Replace with the actual expected content for your device.
+EXPECT_HEX 0x00 "0000000000000000"
+
+END

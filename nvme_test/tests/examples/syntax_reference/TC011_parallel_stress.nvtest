@@ -1,0 +1,11 @@
+TEST "Concurrent Stress Example (mock)"
+
+PARALLEL
+RUN "echo mock-id-ctrl-iteration" LOOP 1000
+EXPECT_EXIT 0
+
+RUN "echo mock-reset-iteration" LOOP 100
+EXPECT_EXIT 0
+END_PARALLEL
+
+END

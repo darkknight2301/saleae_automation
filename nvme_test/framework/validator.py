@@ -155,7 +155,7 @@ def validate(test_case: TestCase, results: List, variable_manager=None) -> Tuple
 def describe_validation(v, variable_manager=None) -> str:
     """Human-readable label for a Validation, independent of any particular
     CommandResult -- e.g. 'Exit code == 0', '"Model Number" contains
-    "Samsung"'. Used by TestRunner to build an aggregate PASS/FAIL summary
+    "KIOXIA"'. Used by TestRunner to build an aggregate PASS/FAIL summary
     for a looped RUN (LOOP > 1), where no single CommandResult represents
     the whole validation the way it does for an ordinary LOOP=1 RUN.
 

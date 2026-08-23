@@ -1,0 +1,8 @@
+TEST "Check NVMe Device"
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+EXPECT "nvme" CONTAINS "nvme"
+
+END

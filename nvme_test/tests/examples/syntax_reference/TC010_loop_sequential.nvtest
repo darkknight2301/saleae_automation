@@ -1,0 +1,7 @@
+TEST "Sequential Loop Example"
+
+RUN "echo mock-id-ctrl-iteration" LOOP 20
+
+EXPECT_EXIT 0
+
+END

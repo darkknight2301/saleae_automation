@@ -1,0 +1,7 @@
+TEST "Missing Variable Example"
+
+RUN "echo {{not_a_real_variable}}"
+
+EXPECT_EXIT 0
+
+END
