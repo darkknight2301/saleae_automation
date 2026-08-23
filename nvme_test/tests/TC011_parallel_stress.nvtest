@@ -1,0 +1,20 @@
+# Demonstrates PARALLEL + LOOP together: two commands run CONCURRENTLY,
+# each in its own thread, one looped 1000x and the other 100x -- exactly
+# the "id-ctrl in a loop 1000 times, nvme reset in a loop 100 times, in
+# separate terminals" scenario, done in one .nvtest file instead of two
+# manually-launched terminals. The framework waits for BOTH loops to
+# finish before the test result is decided. Safe/mock: mirrors real
+# `nvme id-ctrl`/`nvme reset` command shapes with `echo` so it runs
+# without hardware; swap in the real commands to use this against a
+# real device (see tests/examples/ for a hardware-required version).
+TEST "Concurrent Stress Example (mock)"
+
+PARALLEL
+RUN "echo mock-id-ctrl-iteration" LOOP 1000
+EXPECT_EXIT 0
+
+RUN "echo mock-reset-iteration" LOOP 100
+EXPECT_EXIT 0
+END_PARALLEL
+
+END

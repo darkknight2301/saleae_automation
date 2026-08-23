@@ -179,6 +179,8 @@ _HARDWARE_OR_DESTRUCTIVE_EXAMPLES = {
     "TC010_combined_identify_smart.nvtest",        # needs real hardware
     "TC011_combined_identify_smart_fio.nvtest",    # DESTRUCTIVE, writes to a raw block device
     "TC012_combined_passthru_validation.nvtest",   # needs real hardware
+    "TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest",  # needs real hardware
+    "TC014_invalid_field_stderr.nvtest",                       # needs nvme-cli installed
 }
 
 # Examples that are genuinely safe to execute (no hardware, no destructive
@@ -471,6 +473,172 @@ def duplicate_test_names_do_not_collide():
             test_runner.close()
 
 
+def loop_execution_aggregates_correctly():
+    """RUN ... LOOP <n>: every bound EXPECT is checked against every
+    iteration, and the .log/status reflect an aggregate, not just one
+    iteration."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC010_loop_sequential.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        passed, message = result.validation_lines[0]
+        assert passed
+        assert "across 20 iterations: 20 passed, 0 failed" in message, message
+        print(f"[PASS] loop_execution_aggregates_correctly -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
+def loop_execution_reports_first_failure():
+    """A LOOP with an intermittently-failing command must report failed vs
+    passed iteration counts and the first failing iteration, not just an
+    overall FAIL with no detail. Uses an external counter file (not a
+    {{variable}}, which is substituted once per RUN, not per iteration) so
+    the command fails on exactly one specific iteration, deterministically."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        counter_file = os.path.join(tmp, "counter")
+        with open(counter_file, "w") as f:
+            f.write("0")
+
+        script_path = os.path.join(tmp, "flaky.py")
+        with open(script_path, "w") as f:
+            f.write(
+                "import sys\n"
+                f"n = int(open({counter_file!r}).read())\n"
+                f"open({counter_file!r}, 'w').write(str(n + 1))\n"
+                "sys.exit(1 if n == 1 else 0)\n"
+            )
+        path = os.path.join(tmp, "flaky.nvtest")
+        with open(path, "w") as f:
+            f.write(
+                'TEST "Flaky Loop"\n'
+                f'RUN "python3 {script_path}" LOOP 3\n'
+                "EXPECT_EXIT 0\n"
+                "END\n"
+            )
+
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            result = test_runner.run(path)
+            assert result.status == "FAIL", f"expected FAIL, got {result.status}"
+            passed, message = result.validation_lines[0]
+            assert not passed
+            assert "2 passed, 1 failed" in message, message
+            assert "first failure at iteration 2" in message, message
+            print(f"[PASS] loop_execution_reports_first_failure -> {result.log_path}")
+        finally:
+            test_runner.close()
+
+
+def parallel_block_runs_concurrently():
+    """PARALLEL must actually overlap execution wall-clock time, not just
+    run the member RUNs back-to-back under a different label. Proven with
+    sleep-based commands and a generous timing margin (not a tight
+    real-time assertion, to avoid CI flakiness)."""
+    import tempfile
+    import time as _time
+
+    parallel_src = (
+        'TEST "Parallel Timing"\n'
+        "PARALLEL\n"
+        'RUN "sleep 0.05" LOOP 10\n'
+        "EXPECT_EXIT 0\n"
+        'RUN "sleep 0.05" LOOP 10\n'
+        "EXPECT_EXIT 0\n"
+        "END_PARALLEL\n"
+        "END\n"
+    )
+    sequential_src = (
+        'TEST "Sequential Timing"\n'
+        'RUN "sleep 0.05" LOOP 10\n'
+        "EXPECT_EXIT 0\n"
+        'RUN "sleep 0.05" LOOP 10\n'
+        "EXPECT_EXIT 0\n"
+        "END\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        parallel_path = os.path.join(tmp, "parallel.nvtest")
+        sequential_path = os.path.join(tmp, "sequential.nvtest")
+        with open(parallel_path, "w") as f:
+            f.write(parallel_src)
+        with open(sequential_path, "w") as f:
+            f.write(sequential_src)
+
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            t0 = _time.time()
+            result_p = test_runner.run(parallel_path)
+            parallel_elapsed = _time.time() - t0
+
+            t0 = _time.time()
+            result_s = test_runner.run(sequential_path)
+            sequential_elapsed = _time.time() - t0
+
+            assert result_p.status == "PASS" and result_s.status == "PASS"
+            assert parallel_elapsed < sequential_elapsed * 0.75, (
+                f"expected PARALLEL to be meaningfully faster than sequential "
+                f"(parallel={parallel_elapsed:.2f}s, sequential={sequential_elapsed:.2f}s)"
+            )
+            print(
+                f"[PASS] parallel_block_runs_concurrently "
+                f"(parallel={parallel_elapsed:.2f}s vs sequential={sequential_elapsed:.2f}s)"
+            )
+        finally:
+            test_runner.close()
+
+
+def parallel_example_validates_each_loop_independently():
+    """TC011: two concurrently-run loops (1000x and 100x) are each
+    validated on their own terms, both reported in the .log."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC011_parallel_stress.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        messages = [m for _, m in result.validation_lines]
+        assert any("across 1000 iterations: 1000 passed, 0 failed" in m for m in messages), messages
+        assert any("across 100 iterations: 100 passed, 0 failed" in m for m in messages), messages
+        print(f"[PASS] parallel_example_validates_each_loop_independently -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
+def parallel_parser_rejects_invalid_blocks():
+    """Structural PARALLEL rules are enforced: at least 2 RUNs, no nesting,
+    every PARALLEL must be closed by END_PARALLEL before END."""
+    from framework.parser import parse_text, ParseError
+
+    cases = [
+        ('TEST "x"\nPARALLEL\nRUN "a"\nEND_PARALLEL\nEND\n', "only 1 RUN"),
+        ('TEST "x"\nPARALLEL\nRUN "a"\nRUN "b"\nPARALLEL\nRUN "c"\nRUN "d"\nEND_PARALLEL\nEND_PARALLEL\nEND\n', "nested"),
+        ('TEST "x"\nPARALLEL\nRUN "a"\nRUN "b"\nEND\n', "missing END_PARALLEL"),
+        ('TEST "x"\nEND_PARALLEL\nEND\n', "END_PARALLEL without PARALLEL"),
+    ]
+    for src, desc in cases:
+        try:
+            parse_text(src)
+            raise AssertionError(f"expected ParseError for: {desc}")
+        except ParseError:
+            pass
+    print("[PASS] parallel_parser_rejects_invalid_blocks")
+
+
+def expect_stderr_validates_and_excludes_stdout():
+    """TC012: EXPECT_STDERR checks stderr (where plain EXPECT never looks),
+    letting a negative/invalid-field test validate the error message a
+    command prints when it's expected to fail."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC012_stderr_validation.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        messages = [m for _, m in result.validation_lines]
+        assert any("(stderr)" in m for m in messages), "expected at least one (stderr)-tagged validation"
+        print(f"[PASS] expect_stderr_validates_and_excludes_stdout -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
 def main():
     print("Running Phase 1 smoke verification...\n")
     smoke_success()
@@ -514,6 +682,15 @@ def main():
     framework_logger_isolated_across_instances()
     duplicate_test_names_do_not_collide()
     print("\nAll hardening regression checks passed.")
+
+    print("\nRunning LOOP/PARALLEL/EXPECT_STDERR verification...\n")
+    loop_execution_aggregates_correctly()
+    loop_execution_reports_first_failure()
+    parallel_block_runs_concurrently()
+    parallel_example_validates_each_loop_independently()
+    parallel_parser_rejects_invalid_blocks()
+    expect_stderr_validates_and_excludes_stdout()
+    print("\nAll LOOP/PARALLEL/EXPECT_STDERR checks passed.")
 
 
 if __name__ == "__main__":

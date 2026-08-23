@@ -14,6 +14,7 @@ the test" rule.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from .config_manager import ConfigManager
 from .executor import CommandExecutor
@@ -21,7 +22,7 @@ from .framework_log import FrameworkLogger
 from .logger import ResultLogger
 from .parser import TestParser
 from .utility import new_run_id
-from .validator import Validator
+from .validator import Validator, check_validation, describe_validation
 from .variable_manager import VariableManager
 
 SUPPORTED_EXTENSION = ".nvtest"
@@ -83,12 +84,28 @@ class TestRunner:
 
         self.parser = TestParser()
         self.executor = CommandExecutor(default_timeout=self.config.command_timeout)
+        # Still constructed and available as a public attribute for direct use,
+        # even though run() below calls check_validation()/describe_validation()
+        # directly (needed for per-iteration LOOP/PARALLEL aggregation, which
+        # Validator.validate()'s single-CommandResult-per-command shape doesn't
+        # support).
         self.validator = Validator(variable_manager=self.variable_manager)
         self.result_logger = ResultLogger(log_dir=self.run_dir)
 
     def run(self, path: str) -> NvtestResult:
         """Parse, execute, validate, and log a single `.nvtest` file into
         this TestRunner's shared run directory.
+
+        Every RUN executes `loop_counts[i]` times in sequence (1 unless the
+        file used `LOOP <n>`); every validation bound to that RUN is then
+        checked against EVERY iteration, not just one -- the run/test fails
+        if any iteration fails any bound validation. RUN statements sharing
+        a `parallel_group_id` (from a PARALLEL block) execute concurrently,
+        one Python thread per RUN, via ThreadPoolExecutor; the framework
+        waits for the whole group to finish before continuing to whatever
+        follows the PARALLEL block. This is what lets one .nvtest file
+        drive e.g. "id-ctrl looped 1000x" concurrently with "reset looped
+        100x" (see USER_GUIDE.md's Parallel/Loop Execution section).
 
         Raises:
             UnsupportedFileTypeError: if `path` does not end in .nvtest.
@@ -105,30 +122,124 @@ class TestRunner:
             commands = [self.variable_manager.substitute(c) for c in commands]
 
         self.log.info(f"Running: {test_case.name}")
-        results = [self.executor.run(cmd) for cmd in commands]
 
-        binary_flags = [False] * len(results)
+        n = len(commands)
+        validations_by_index = {}
+        for v in test_case.validations:
+            validations_by_index.setdefault(v.run_index, []).append(v)
+
+        binary_flags = [False] * n
         for v in test_case.validations:
             if v.kind in ("BYTE", "HEX"):
                 binary_flags[v.run_index] = True
 
-        validation_results, all_passed = self.validator.validate(test_case, results)
-        validation_lines = [
-            f"[{'PASS' if r.passed else 'FAIL'}] {r.message}" for r in validation_results
-        ]
+        results = [None] * n
+        loop_infos = [None] * n
+        # per index: (bound_validations, pass_counts, fail_counts, last_message,
+        #             first_failure_by_vid) -- all keyed by id(validation)
+        per_index_validation_data = [None] * n
+
+        def execute_slot(i):
+            cmd = commands[i]
+            loop_count = test_case.loop_counts[i]
+            bound = validations_by_index.get(i, [])
+            pass_counts = {id(v): 0 for v in bound}
+            fail_counts = {id(v): 0 for v in bound}
+            last_message = {}
+            first_failure_by_vid = {}
+            last_result = None
+            iterations_run = 0
+
+            for iteration in range(1, loop_count + 1):
+                result = self.executor.run(cmd)
+                last_result = result
+                iterations_run += 1
+                for v in bound:
+                    passed, message = check_validation(v, result, self.variable_manager)
+                    last_message[id(v)] = message
+                    if passed:
+                        pass_counts[id(v)] += 1
+                    else:
+                        fail_counts[id(v)] += 1
+                        first_failure_by_vid.setdefault(id(v), (iteration, message))
+
+            results[i] = last_result
+            parallel_group = test_case.parallel_group_id[i]
+            if loop_count > 1 or parallel_group is not None:
+                overall_first_failure = min(first_failure_by_vid.values(), default=None,
+                                             key=lambda pair: pair[0])
+                loop_infos[i] = {
+                    "loop_count": loop_count,
+                    "parallel_group": parallel_group,
+                    "iterations_run": iterations_run,
+                    "first_failure": overall_first_failure,
+                }
+            return bound, pass_counts, fail_counts, last_message, first_failure_by_vid
+
+        executed = [False] * n
+        for i in range(n):
+            if executed[i]:
+                continue
+            group = test_case.parallel_group_id[i]
+            if group is None:
+                per_index_validation_data[i] = execute_slot(i)
+                executed[i] = True
+            else:
+                group_indices = [
+                    j for j in range(n)
+                    if test_case.parallel_group_id[j] == group and not executed[j]
+                ]
+                self.log.info(
+                    f"Running PARALLEL group {group} ({len(group_indices)} commands concurrently)"
+                )
+                with ThreadPoolExecutor(max_workers=len(group_indices)) as pool:
+                    futures = {pool.submit(execute_slot, j): j for j in group_indices}
+                    for future, j in futures.items():
+                        per_index_validation_data[j] = future.result()
+                        executed[j] = True
+
+        validation_lines = []
+        validation_bool_pairs = []
+        all_passed = True
+
+        for v in test_case.validations:
+            loop_count = test_case.loop_counts[v.run_index]
+            _, pass_counts, fail_counts, last_message, first_failure_by_vid = \
+                per_index_validation_data[v.run_index]
+            failed_count = fail_counts[id(v)]
+            passed = failed_count == 0
+
+            if loop_count == 1:
+                # Byte-for-byte identical to the pre-LOOP/PARALLEL behavior:
+                # exactly one iteration ran, so its message IS the result.
+                message = last_message[id(v)]
+            else:
+                message = (
+                    f"{describe_validation(v, self.variable_manager)} across "
+                    f"{loop_count} iterations: {pass_counts[id(v)]} passed, {failed_count} failed"
+                )
+                if not passed:
+                    fail_iter, fail_msg = first_failure_by_vid[id(v)]
+                    message += f" (first failure at iteration {fail_iter}: {fail_msg})"
+
+            all_passed = all_passed and passed
+            validation_bool_pairs.append((passed, message))
+            validation_lines.append(f"[{'PASS' if passed else 'FAIL'}] {message}")
+
         status = "PASS" if all_passed else "FAIL"
         self.log.info(f"{test_case.name}: {status}")
 
         log_path = self.result_logger.write_nvtest_log(
             test_case.name, results, binary_flags, validation_lines, status,
             filename_stem=os.path.splitext(os.path.basename(path))[0],
+            loop_infos=loop_infos,
         )
 
         return NvtestResult(
             name=test_case.name,
             status=status,
             log_path=log_path,
-            validation_lines=[(r.passed, r.message) for r in validation_results],
+            validation_lines=validation_bool_pairs,
             source_path=path,
         )
 

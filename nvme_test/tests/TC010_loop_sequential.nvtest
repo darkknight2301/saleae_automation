@@ -1,0 +1,11 @@
+# Demonstrates RUN ... LOOP <n>: this command executes 20 times in
+# sequence, and EXPECT_EXIT 0 is checked after every single iteration --
+# the test FAILs if any iteration's exit code doesn't match, not just the
+# last one. Safe/mock: no hardware needed.
+TEST "Sequential Loop Example"
+
+RUN "echo mock-id-ctrl-iteration" LOOP 20
+
+EXPECT_EXIT 0
+
+END

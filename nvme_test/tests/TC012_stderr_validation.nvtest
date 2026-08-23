@@ -1,0 +1,17 @@
+# Demonstrates EXPECT_STDERR: a command is EXPECTED to fail (nonzero exit)
+# because of an invalid field/argument, and the test validates the error
+# message that appears on STDERR -- something plain EXPECT cannot do,
+# since EXPECT only ever looks at stdout. Mocked here (no hardware
+# needed) with a small Python script standing in for `nvme` printing an
+# "invalid field" style error to stderr and exiting 1, exactly like
+# nvme-cli does for a real invalid/unrecognized argument.
+TEST "Negative Test - Invalid Field on Stderr"
+
+RUN "python3 -c 'import sys; print(\"nvme: invalid field specified\", file=sys.stderr); sys.exit(1)'"
+
+EXPECT_EXIT 1
+EXPECT_STDERR "invalid field" CONTAINS "invalid field"
+EXPECT_STDERR "nvme" NOT_EMPTY
+EXPECT "invalid" NOT_CONTAINS
+
+END

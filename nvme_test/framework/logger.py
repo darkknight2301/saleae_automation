@@ -32,33 +32,64 @@ def _footer(result_status: str, end_str: str):
     return ["", "RESULT:", result_status, "", f"END: {end_str}", "=" * 40]
 
 
-def _render_command_block(result, binary_output: bool):
+def _render_command_block(result, binary_output: bool, loop_info: dict = None):
     """Render the COMMAND / EXIT CODE / OUTPUT (or BINARY OUTPUT) / STDERR
     section for a single CommandResult. Shared by write_log() (Phase 1,
     single-command logs) and write_nvtest_log() (Phase 2, multi-RUN .nvtest
     logs) so both stay byte-for-byte consistent.
+
+    `loop_info`, if given, is a dict describing a looped/parallel RUN
+    (LOOP > 1 and/or inside a PARALLEL block):
+        {"loop_count": int, "parallel_group": Optional[int],
+         "iterations_run": int, "first_failure": Optional[(int, str)]}
+    `result` is then understood to be the LAST iteration's CommandResult.
+    When `loop_info` is None (the default, and the only case for every
+    .nvtest file that doesn't use LOOP/PARALLEL), rendering is completely
+    unchanged from before this feature existed.
     """
     lines = []
     lines.append("COMMAND:")
     lines.append(result.command)
     lines.append("")
-    lines.append("EXIT CODE:")
+
+    if loop_info is not None:
+        lines.append("LOOP COUNT:")
+        lines.append(str(loop_info["loop_count"]))
+        lines.append("")
+        if loop_info["parallel_group"] is not None:
+            lines.append("PARALLEL GROUP:")
+            lines.append(str(loop_info["parallel_group"]))
+            lines.append("")
+        lines.append("ITERATIONS RUN:")
+        lines.append(str(loop_info["iterations_run"]))
+        lines.append("")
+
+    lines.append("EXIT CODE (last iteration):" if loop_info is not None else "EXIT CODE:")
     lines.append(str(result.exit_code))
     lines.append("")
 
+    output_label = "OUTPUT (last iteration):" if loop_info is not None else "OUTPUT:"
+    binary_label = "BINARY OUTPUT (last iteration):" if loop_info is not None else "BINARY OUTPUT:"
+
     if binary_output:
-        lines.append("BINARY OUTPUT:")
+        lines.append(binary_label)
         lines.append(f"Size: {len(result.stdout)} bytes")
         lines.append("")
         lines.append(_hex_dump(result.stdout))
     else:
-        lines.append("OUTPUT:")
+        lines.append(output_label)
         lines.append(result.stdout_text())
 
     if result.stderr:
         lines.append("")
-        lines.append("STDERR:")
+        lines.append("STDERR:" if loop_info is None else "STDERR (last iteration):")
         lines.append(result.stderr_text())
+
+    if loop_info is not None:
+        lines.append("")
+        lines.append("FIRST FAILURE:")
+        first_failure = loop_info["first_failure"]
+        lines.append("(none)" if first_failure is None else f"Iteration {first_failure[0]}: {first_failure[1]}")
 
     return lines
 
@@ -126,6 +157,7 @@ class ResultLogger:
         result_status: str,
         log_path: str = None,
         filename_stem: str = None,
+        loop_infos=None,
     ) -> str:
         """Write a single .log file for a `.nvtest` test case (Phase 2).
 
@@ -138,7 +170,8 @@ class ResultLogger:
         Args:
             test_name:        name shown in the TEST: header (free text,
                                 from the .nvtest file's TEST "..." line).
-            results:           list of CommandResult, one per RUN, in order.
+            results:           list of CommandResult, one per RUN, in order
+                                (the LAST iteration's result, for a looped RUN).
             binary_flags:      list of bool, same length as results; True
                                 means that command's output is rendered as a
                                 hex dump instead of text.
@@ -160,11 +193,20 @@ class ResultLogger:
                                 silently overwrite each other's .log).
                                 Falls back to test_name if not given, for
                                 callers with no source file (e.g. ad hoc use).
+            loop_infos:        optional list, same length as results; each
+                                entry is either None (ordinary single-shot
+                                RUN, rendered exactly as before this feature
+                                existed) or a loop-info dict (see
+                                _render_command_block) for a RUN that used
+                                LOOP and/or PARALLEL.
 
         Returns:
             The path of the log file written.
         """
         assert len(results) == len(binary_flags), "results/binary_flags length mismatch"
+        if loop_infos is None:
+            loop_infos = [None] * len(results)
+        assert len(loop_infos) == len(results), "results/loop_infos length mismatch"
 
         start_str = format_timestamp(results[0].start_time) if results else format_timestamp(time.time())
         end_str = format_timestamp(results[-1].end_time) if results else start_str
@@ -172,7 +214,7 @@ class ResultLogger:
         lines = _header(test_name, start_str)
 
         for i, result in enumerate(results):
-            lines.extend(_render_command_block(result, binary_flags[i]))
+            lines.extend(_render_command_block(result, binary_flags[i], loop_infos[i]))
             lines.append("")
 
         lines.append("VALIDATION:")

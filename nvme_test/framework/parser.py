@@ -7,9 +7,9 @@ Design intent (Phase 2):
   in runner.py, which refuses to even call this parser on the wrong file type.
 - The DSL is intentionally tiny and line-oriented: one statement per line,
   each line starts with a keyword (TEST, RUN, EXPECT_EXIT, EXPECT,
-  EXPECT_BYTE, EXPECT_HEX, END). There is no branching, looping, variables,
-  or expression language -- this is a manual-test-case format, not a
-  programming language.
+  EXPECT_STDERR, EXPECT_BYTE, EXPECT_HEX, PARALLEL, END_PARALLEL, END).
+  There is no branching or expression language -- this is a manual-test-case
+  format, not a programming language.
 - Parsing is strict and deterministic: unknown keywords, wrong argument
   counts, and structural mistakes (missing TEST/END, validation with no
   preceding RUN, etc.) all raise ParseError with a line number, so bad
@@ -22,6 +22,25 @@ Design intent (Phase 2):
 - The output is a plain, framework-internal TestCase / Validation model
   (dataclasses). Nothing here exposes Python objects, syntax, or semantics
   to the test writer -- they only ever see the DSL.
+
+Loop/Parallel addition:
+- `RUN "<command>" LOOP <n>` runs that command sequentially `n` times
+  in place of once. Every EXPECT* bound to it is then checked against
+  EVERY iteration, not just one -- the test fails if any iteration fails
+  any bound validation. Omitting `LOOP <n>` is exactly `LOOP 1`, which is
+  identical to the pre-existing single-execution behavior (no change for
+  any existing .nvtest file).
+- `PARALLEL` / `END_PARALLEL` wraps two or more RUN statements (each with
+  its own optional LOOP) that execute concurrently, one OS thread per RUN,
+  with the framework waiting for all of them to finish before the test
+  continues past END_PARALLEL. This is what makes "id-ctrl looped 1000x
+  concurrently with reset looped 100x" expressible in one .nvtest file.
+  Nesting PARALLEL blocks is not supported.
+
+Stderr validation addition:
+- `EXPECT_STDERR "<field>" CONTAINS|NOT_CONTAINS|NOT_EMPTY ...` is
+  identical in grammar to EXPECT, but checks the bound command's stderr
+  instead of its stdout (plain EXPECT never looked at stderr at all).
 """
 
 import shlex
@@ -57,11 +76,17 @@ BYTE = "BYTE"
 HEX = "HEX"
 
 _TEXT_OPERATORS = {"CONTAINS", "NOT_CONTAINS", "NOT_EMPTY"}
+_TEXT_KIND_BY_OPERATOR = {
+    "CONTAINS": TEXT_CONTAINS,
+    "NOT_CONTAINS": TEXT_NOT_CONTAINS,
+    "NOT_EMPTY": TEXT_NOT_EMPTY,
+}
 
 
 @dataclass
 class Validation:
-    """One EXPECT_EXIT / EXPECT / EXPECT_BYTE / EXPECT_HEX statement.
+    """One EXPECT_EXIT / EXPECT / EXPECT_STDERR / EXPECT_BYTE / EXPECT_HEX
+    statement.
 
     `run_index` binds this validation to the output of a specific RUN
     statement -- the nearest RUN that appeared above it in the file. This
@@ -74,9 +99,10 @@ class Validation:
     line_no: int
     # EXIT
     expected_exit: Optional[int] = None
-    # TEXT_*
+    # TEXT_* (EXPECT / EXPECT_STDERR)
     field: Optional[str] = None
     value: Optional[str] = None
+    stream: str = "stdout"  # "stdout" (EXPECT) or "stderr" (EXPECT_STDERR)
     # BYTE / HEX
     offset: Optional[int] = None
     expected_byte: Optional[int] = None
@@ -88,15 +114,24 @@ class TestCase:
     """Internal representation of a parsed .nvtest file.
 
     TestCase
-     |-- name          : str, from TEST "..."
-     |-- commands       : list[str], one per RUN "...", in order
-     |-- validations    : list[Validation], in declared order
+     |-- name              : str, from TEST "..."
+     |-- commands           : list[str], one per RUN "...", in order
+     |-- validations        : list[Validation], in declared order
+     |-- loop_counts        : list[int], same length/order as `commands`;
+     |                         1 unless that RUN used "LOOP <n>"
+     |-- parallel_group_id  : list[Optional[int]], same length/order as
+                              `commands`; None for a normal sequential RUN,
+                              or a shared int for every RUN inside the same
+                              PARALLEL block (so the runner knows which
+                              commands to execute concurrently together)
     """
 
     name: str
     commands: List[str] = field(default_factory=list)
     validations: List[Validation] = field(default_factory=list)
     source_path: Optional[str] = None
+    loop_counts: List[int] = field(default_factory=list)
+    parallel_group_id: List[Optional[int]] = field(default_factory=list)
 
 
 def _split_tokens(line: str, line_no: int) -> List[str]:
@@ -114,6 +149,43 @@ def _parse_int_maybe_hex(token: str, line_no: int, line: str, what: str) -> int:
         raise ParseError(f"expected an integer for {what}, got {token!r}", line_no, line)
 
 
+def _parse_text_expect(tokens, i, raw_line, keyword, kind_prefix, current_run_index, stream, validations):
+    """Shared grammar for EXPECT and EXPECT_STDERR: "<field>"
+    CONTAINS/NOT_CONTAINS/NOT_EMPTY ["<value>"], differing only in which
+    stream (`stdout`/`stderr`) the resulting Validation checks."""
+    if current_run_index == -1:
+        raise ParseError(f"{keyword} must come after a RUN statement", i, raw_line)
+    if len(tokens) < 3:
+        raise ParseError(
+            f'expected: {keyword} "<field>" CONTAINS "<value>" | '
+            f'{keyword} "<field>" NOT_CONTAINS | {keyword} "<field>" NOT_EMPTY',
+            i, raw_line,
+        )
+    field_name = tokens[1]
+    operator = tokens[2]
+    if operator not in _TEXT_OPERATORS:
+        raise ParseError(
+            f"unknown {keyword} operator {operator!r} "
+            f"(expected CONTAINS, NOT_CONTAINS, or NOT_EMPTY)",
+            i, raw_line,
+        )
+    kind = _TEXT_KIND_BY_OPERATOR[operator]
+    if operator == "CONTAINS":
+        if len(tokens) != 4:
+            raise ParseError(f'expected: {keyword} "<field>" CONTAINS "<value>"', i, raw_line)
+        validations.append(Validation(
+            kind=kind, run_index=current_run_index, line_no=i,
+            field=field_name, value=tokens[3], stream=stream,
+        ))
+    else:
+        if len(tokens) != 3:
+            raise ParseError(f'expected: {keyword} "<field>" {operator}', i, raw_line)
+        validations.append(Validation(
+            kind=kind, run_index=current_run_index, line_no=i,
+            field=field_name, stream=stream,
+        ))
+
+
 def parse_text(text: str, source_path: str = None) -> TestCase:
     """Parse .nvtest source text into a TestCase. Raises ParseError on any
     invalid syntax or structure."""
@@ -124,8 +196,16 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
     end_seen = False
     commands: List[str] = []
     validations: List[Validation] = []
+    loop_counts: List[int] = []
+    parallel_group_id: List[Optional[int]] = []
     current_run_index = -1  # -1 means "no RUN encountered yet"
     statements_seen = 0  # non-blank lines processed so far
+
+    in_parallel = False
+    parallel_block_start_line = None
+    current_parallel_group = None
+    next_parallel_group = 0
+    parallel_group_run_count = 0  # RUN statements seen since the current PARALLEL opened
 
     for i, raw_line in enumerate(raw_lines, start=1):
         line = raw_line.strip()
@@ -152,12 +232,50 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
                 raise ParseError('expected: TEST "<name>"', i, raw_line)
             test_name = tokens[1]
 
+        elif keyword == "PARALLEL":
+            if test_name is None:
+                raise ParseError("PARALLEL must come after TEST", i, raw_line)
+            if in_parallel:
+                raise ParseError("nested PARALLEL blocks are not supported", i, raw_line)
+            if len(tokens) != 1:
+                raise ParseError("PARALLEL takes no arguments", i, raw_line)
+            in_parallel = True
+            parallel_block_start_line = i
+            current_parallel_group = next_parallel_group
+            next_parallel_group += 1
+            parallel_group_run_count = 0
+
+        elif keyword == "END_PARALLEL":
+            if not in_parallel:
+                raise ParseError("END_PARALLEL without a matching PARALLEL", i, raw_line)
+            if len(tokens) != 1:
+                raise ParseError("END_PARALLEL takes no arguments", i, raw_line)
+            if parallel_group_run_count < 2:
+                raise ParseError(
+                    "a PARALLEL block must contain at least 2 RUN statements "
+                    f"(found {parallel_group_run_count})",
+                    parallel_block_start_line, None,
+                )
+            in_parallel = False
+            current_parallel_group = None
+
         elif keyword == "RUN":
             if test_name is None:
                 raise ParseError("RUN must come after TEST", i, raw_line)
-            if len(tokens) != 2:
-                raise ParseError('expected: RUN "<command>"', i, raw_line)
+            if len(tokens) not in (2, 4):
+                raise ParseError('expected: RUN "<command>" [LOOP <n>]', i, raw_line)
+            loop_count = 1
+            if len(tokens) == 4:
+                if tokens[2] != "LOOP":
+                    raise ParseError('expected: RUN "<command>" LOOP <n>', i, raw_line)
+                loop_count = _parse_int_maybe_hex(tokens[3], i, raw_line, "RUN ... LOOP")
+                if loop_count < 1:
+                    raise ParseError("LOOP count must be >= 1", i, raw_line)
             commands.append(tokens[1])
+            loop_counts.append(loop_count)
+            parallel_group_id.append(current_parallel_group)
+            if in_parallel:
+                parallel_group_run_count += 1
             current_run_index = len(commands) - 1
 
         elif keyword == "EXPECT_EXIT":
@@ -172,43 +290,12 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
             ))
 
         elif keyword == "EXPECT":
-            if current_run_index == -1:
-                raise ParseError("EXPECT must come after a RUN statement", i, raw_line)
-            if len(tokens) < 3:
-                raise ParseError(
-                    'expected: EXPECT "<field>" CONTAINS "<value>" | '
-                    'EXPECT "<field>" NOT_CONTAINS | EXPECT "<field>" NOT_EMPTY',
-                    i, raw_line,
-                )
-            field_name = tokens[1]
-            operator = tokens[2]
-            if operator not in _TEXT_OPERATORS:
-                raise ParseError(
-                    f"unknown EXPECT operator {operator!r} "
-                    f"(expected CONTAINS, NOT_CONTAINS, or NOT_EMPTY)",
-                    i, raw_line,
-                )
-            if operator == "CONTAINS":
-                if len(tokens) != 4:
-                    raise ParseError('expected: EXPECT "<field>" CONTAINS "<value>"', i, raw_line)
-                validations.append(Validation(
-                    kind=TEXT_CONTAINS, run_index=current_run_index, line_no=i,
-                    field=field_name, value=tokens[3],
-                ))
-            elif operator == "NOT_CONTAINS":
-                if len(tokens) != 3:
-                    raise ParseError('expected: EXPECT "<field>" NOT_CONTAINS', i, raw_line)
-                validations.append(Validation(
-                    kind=TEXT_NOT_CONTAINS, run_index=current_run_index, line_no=i,
-                    field=field_name,
-                ))
-            else:  # NOT_EMPTY
-                if len(tokens) != 3:
-                    raise ParseError('expected: EXPECT "<field>" NOT_EMPTY', i, raw_line)
-                validations.append(Validation(
-                    kind=TEXT_NOT_EMPTY, run_index=current_run_index, line_no=i,
-                    field=field_name,
-                ))
+            _parse_text_expect(tokens, i, raw_line, "EXPECT", TEXT_CONTAINS,
+                                current_run_index, "stdout", validations)
+
+        elif keyword == "EXPECT_STDERR":
+            _parse_text_expect(tokens, i, raw_line, "EXPECT_STDERR", TEXT_CONTAINS,
+                                current_run_index, "stderr", validations)
 
         elif keyword == "EXPECT_BYTE":
             if current_run_index == -1:
@@ -247,6 +334,8 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
         elif keyword == "END":
             if len(tokens) != 1:
                 raise ParseError("END takes no arguments", i, raw_line)
+            if in_parallel:
+                raise ParseError("missing END_PARALLEL before END", i, raw_line)
             end_seen = True
 
         else:
@@ -256,10 +345,15 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
         raise ParseError("missing TEST statement (every .nvtest file must start with TEST \"<name>\")")
     if not commands:
         raise ParseError("no RUN statement found (every .nvtest file needs at least one RUN)")
+    if in_parallel:
+        raise ParseError("missing END_PARALLEL (PARALLEL block never closed)", parallel_block_start_line, None)
     if not end_seen:
         raise ParseError("missing END statement (every .nvtest file must end with END)")
 
-    return TestCase(name=test_name, commands=commands, validations=validations, source_path=source_path)
+    return TestCase(
+        name=test_name, commands=commands, validations=validations, source_path=source_path,
+        loop_counts=loop_counts, parallel_group_id=parallel_group_id,
+    )
 
 
 def parse_file(path: str) -> TestCase:
