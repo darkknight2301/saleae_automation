@@ -1,1180 +1,218 @@
-# NVMe/FIO Test Automation Framework — Developer Guide
+# DEVELOPER_GUIDE.md — NVMe/FIO Test Automation Framework
 
-This guide is for engineers maintaining, debugging, or extending the framework. All class
-names, method names, file paths, and behavior described here were verified directly against
-the source in `framework/` and `run.py`, and by actually executing the code shown.
+For engineers maintaining/extending the framework.
 
-```
-CLI (framework/cli.py)
- |
- v
-ConfigManager (framework/config_manager.py)
- |
- v
-TestRunner construction (framework/runner.py) -- creates run dir, FrameworkLogger,
- |                                                VariableManager, TestParser,
- |                                                CommandExecutor, Validator, ResultLogger
- v
-Test discovery (framework/cli.py: discover_targets)
- |
- v
-TestParser.parse() -> TestCase (framework/parser.py)
- |
- v
-TestRunner.run() orchestrates:
- |
- v
-CommandExecutor.run() -> CommandResult (framework/executor.py)
- |
- v
-Validator.validate() -> ValidationResult (framework/validator.py)
- |
- v
-ResultLogger.write_nvtest_log() (framework/logger.py)
- |
- v
-Log file in logs/{run_id}/
-```
-
----
-
-## 1. Architecture Overview
+## 1. Architecture & Execution Flow
 
 ```
-run.py
-  |
-  +-- (no args) --> internal self-verification (functions defined directly in run.py)
-  |
-  +-- (args)    --> framework.cli.main(argv)
-                       |
-                       +-- ConfigManager(args.config)
-                       +-- TestRunner(config=...)      <-- one instance per CLI invocation
-                             |
-                             +-- FrameworkLogger        (console + run.log)
-                             +-- VariableManager         (loads common_variables.json)
-                             +-- TestParser
-                             +-- CommandExecutor
-                             +-- Validator
-                             +-- ResultLogger
-                       |
-                       +-- discover_targets(path) --> [CliTarget, ...]
-                       +-- run_targets(targets, test_runner) --> [(label, status, detail), ...]
-                             (each target: test_runner.run(path))
-                       +-- print_summary(rows, test_runner.log)
-                       +-- test_runner.close()
+run.py (argv) -> framework.cli.main()
+  -> ConfigManager(args.config)
+  -> TestRunner(config)             # one per invocation: run dir, FrameworkLogger,
+  |                                 # VariableManager, TestParser, CommandExecutor,
+  |                                 # Validator, ResultLogger
+  -> cli.discover_targets(path)     # file, or *.nvtest glob of a dir (non-recursive)
+  -> cli.run_targets(targets, test_runner)
+       -> test_runner.run(path) per target:
+            TestParser.parse -> TestCase
+            -> per command index: substitute {{vars}} JIT -> CommandExecutor.run() (looped,
+               and/or concurrently via ThreadPoolExecutor for a PARALLEL group)
+            -> check_validation() per iteration -> aggregate pass/fail
+            -> ResultLogger.write_nvtest_log() -> logs/{run_id}/<file>.log
+  -> cli.print_summary() -> FrameworkLogger.result_line()
+  -> test_runner.close()
 ```
+`run.py` with **no argv** instead runs its own self-verification functions (defined directly
+in `run.py`), not `cli.main()`.
 
-**Class responsibility summary:**
+## 2. Modules & Classes
 
-| Class | Responsibility |
-|---|---|
-| `TestRunner` | Owns one execution: one run directory, one `ConfigManager`, one `VariableManager`, and the shared `CommandExecutor`/`Validator`/`ResultLogger`/`FrameworkLogger` instances used for every `.nvtest` file run through it |
-| `TestParser` | Thin object wrapper around `parse_file()`/`parse_text()` |
-| `TestCase` / `Validation` | Plain dataclasses -- the parsed, in-memory representation of one `.nvtest` file |
-| `CommandExecutor` | Runs one shell command, returns a `CommandResult` |
-| `CommandResult` | Plain dataclass -- exit code + raw stdout/stderr bytes + timing |
-| `Validator` | Runs every `Validation` in a `TestCase` against its bound `CommandResult`, returns `ValidationResult`s |
-| `ValidationResult` | Plain dataclass -- `passed: bool`, `message: str` |
-| `ResultLogger` | Formats one test's commands/output/validations into its `.log` file |
-| `FrameworkLogger` | Console + `run.log` diagnostic logging (INFO/DEBUG/WARNING/ERROR) -- not test-result `.log` files |
-| `ConfigManager` | Loads/merges YAML config with built-in defaults |
-| `VariableManager` | Loads `common_variables.json`, resolves `{{name}}` placeholders |
-| `Utility` (module, not a class) | `hex_dump`, `safe_filename`, `format_timestamp`, `new_run_id`, `parse_int_maybe_hex` |
-| `CliTarget` | One resolved file path + its CLI display label |
-
-**Design decisions worth knowing:**
-- `Executor` and `Logger` still exist as **backward-compatible aliases** (`Executor =
-  CommandExecutor` in `executor.py`; `Logger = ResultLogger` in `logger.py`) from earlier
-  naming. New code should use `CommandExecutor`/`ResultLogger` directly.
-- There is a module-level `validate()` function in `validator.py` in addition to the
-  `Validator` class; `Validator.validate()` is a thin wrapper delegating to it. This is
-  acknowledged, low-priority duplication (documented technical debt, not a bug) rather than an
-  oversight — see Section 24.
-
----
-
-## 2. Repository Structure
-
-```
-nvme_test/
-├── run.py                       # CLI entry point + internal self-verification harness
-├── requirements.txt              # PyYAML>=6.0
-├── common_variables.json         # shipped default variables file
-├── config/
-│   └── config.yaml                # shipped config template (NOT auto-loaded, see cli.py)
-├── framework/
-│   ├── __init__.py                # empty
-│   ├── parser.py                   # ParseError, Validation, TestCase, TestParser, parse_text/parse_file
-│   ├── validator.py                 # ValidationResult, validate(), Validator
-│   ├── executor.py                  # CommandResult, CommandExecutor (alias: Executor)
-│   ├── runner.py                    # UnsupportedFileTypeError, NvtestResult, TestRunner,
-│   │                                  check_extension(), run_nvtest_file()
-│   ├── logger.py                    # ResultLogger (alias: Logger), private render helpers
-│   ├── framework_log.py             # FrameworkLogger
-│   ├── config_manager.py            # ConfigManager, _DEFAULTS
-│   ├── variable_manager.py          # VariableError, VariableManager
-│   ├── utility.py                   # hex_dump, safe_filename, format_timestamp, new_run_id,
-│   │                                  parse_int_maybe_hex
-│   └── cli.py                       # CliTarget, build_arg_parser, discover_targets,
-│                                      run_targets, dry_run_targets, print_summary, main
-├── tests/                         # .nvtest files used by run.py's internal self-verification
-│   └── examples/                    # realistic examples, never auto-executed if
-│                                      hardware-required/destructive (see run.py's
-│                                      _HARDWARE_OR_DESTRUCTIVE_EXAMPLES set)
-└── logs/                          # created at runtime; one logs/{run_id}/ per execution
-```
-
-**Per-module responsibility, dependencies, and what belongs/doesn't belong there:**
-
-- **`parser.py`** — Owns `.nvtest` syntax only. Depends on `utility.parse_int_maybe_hex`.
-  Nothing here should know about `subprocess`, YAML, JSON, or logging.
-- **`validator.py`** — Owns comparison logic against a `CommandResult`. Depends on `parser`
-  (for the `Validation` dataclass and kind constants). Takes an optional `VariableManager` for
-  substituting `CONTAINS` values — does not import `variable_manager` at module scope beyond
-  what's passed in, keeping it decoupled.
-- **`executor.py`** — Owns `subprocess` invocation only. No parsing, no validation, no
-  knowledge of `.nvtest` at all — by design, a command is just a string.
-- **`runner.py`** — The only module that imports from every other framework module
-  (`config_manager`, `executor`, `framework_log`, `logger`, `parser`, `utility`, `validator`,
-  `variable_manager`). This is intentional: it's the orchestration layer. Nothing else should
-  need this many imports.
-- **`logger.py`** — Owns `.log` file formatting/writing only. Depends on `utility` for
-  `hex_dump`/`safe_filename`/`format_timestamp`. Does not know about `TestCase`,
-  `Validation`, or `CommandExecutor` — it receives already-computed results and strings.
-- **`framework_log.py`** — Owns console/`run.log` diagnostics only (stdlib `logging`). No
-  dependency on any other framework module.
-- **`config_manager.py`** — Owns YAML loading + defaults only. Depends only on `yaml`
-  (soft-imported) and stdlib `os`.
-- **`variable_manager.py`** — Owns JSON loading + `{{name}}` substitution only. No
-  dependency on any other framework module.
-- **`utility.py`** — The **one** common utility module. Only generic, reusable,
-  non-test-specific helpers belong here (hex formatting, filename sanitization, timestamp
-  formatting, run-id generation, int-or-hex parsing). Do not add anything here that only one
-  module needs, and do not add `.nvtest`-specific or NVMe-specific logic here.
-- **`cli.py`** — Owns `argparse` + directory/file discovery + result-row formatting only. Constructs
-  exactly one `TestRunner` per invocation and reuses it for every discovered target.
-
----
-
-## 3. Execution Lifecycle
-
-Tracing `python3 run.py tests/TC001.nvtest`:
-
-1. **`run.py`** inserts its own directory onto `sys.path`, imports `framework.cli`, and (since
-   `len(sys.argv) > 1`) calls `sys.exit(cli.main(sys.argv[1:]))`.
-2. **`cli.main(argv)`** (`framework/cli.py`) builds an `argparse.ArgumentParser`
-   (`build_arg_parser()`) and parses `argv` into `args` (`path`, `config`, `log_level`,
-   `dry_run`).
-3. **Configuration loading:** `ConfigManager(args.config)` is constructed. If `args.config` is
-   `None` (the common case), `ConfigManager.__init__` skips file I/O entirely and uses its
-   built-in `_DEFAULTS` dict. If a path is given, it's read via `yaml.safe_load()` and merged
-   over the defaults (`_merge()`). A missing file or missing PyYAML raises immediately, caught
-   in `cli.main()` and reported via a bare `print()` (the one place in the framework that
-   still uses `print()` directly, because no logger can exist yet — see Section 10).
-4. **`TestRunner(config=config)`** is constructed (`framework/runner.py`):
-   - `self.run_id = new_run_id()` (`utility.py`) — `YYYYMMDD_HHMMSS_<8-hex>`.
-   - `self.run_dir = os.path.join(config.log_directory, self.run_id)`, created via
-     `os.makedirs(..., exist_ok=True)`.
-   - `self.log = FrameworkLogger(level=config.log_level, run_dir=self.run_dir)` — this is
-     **logger initialization**, and it happens here, tied to the run directory.
-   - `VariableManager` is loaded from `config.variables_file` if that path exists on disk (a
-     missing variables file is not an error at this stage — it's simply not loaded, and any
-     `{{...}}` in a later `.nvtest` file would then fail at substitution time instead).
-   - `TestParser()`, `CommandExecutor(default_timeout=config.command_timeout)`,
-     `Validator(variable_manager=...)`, `ResultLogger(log_dir=self.run_dir)` are constructed.
-5. **`if args.log_level:`** — `cli.main()` calls `test_runner.log.set_level(args.log_level)`
-   to override the console level for this invocation only.
-6. **Test discovery:** `discover_targets(args.path)` — if `args.path` is a directory, globs
-   `*.nvtest` inside it (non-recursive) and sorts the result; if it's a file, wraps it as a
-   single `CliTarget` regardless of extension (rejection happens later, uniformly).
-7. **`run_targets(targets, test_runner)`** iterates the targets; for each, calls
-   `test_runner.run(target.path)`:
-   - **Extension check:** `check_extension(path)` — raises `UnsupportedFileTypeError` if the
-     path doesn't end in `.nvtest`.
-   - **Parsing:** `self.parser.parse(path)` → `TestParser.parse()` → `parse_file()` →
-     `parse_text()`, producing a `TestCase`.
-   - **Variable substitution (commands):** if a `VariableManager` was loaded, every command
-     string in `test_case.commands` is passed through `substitute()`.
-   - **Command execution:** for each command index, `RUN`s sharing a `parallel_group_id`
-     execute concurrently via `ThreadPoolExecutor`; every other index executes sequentially,
-     one at a time. Each index's command runs `loop_counts[i]` times in sequence (1 unless
-     `LOOP <n>` was used) — see Section 7a for the full mechanics.
-   - **Binary-flag detection:** for each `Validation` of kind `BYTE`/`HEX`, the corresponding
-     command's index in `binary_flags` is set `True` (drives hex-dump vs. text rendering).
-   - **Validation:** each bound `Validation` is checked via `check_validation()` once per
-     iteration of its command (once, for an ordinary `LOOP 1` command — identical to before),
-     with pass/fail counts and first-failure detail accumulated per validation. See Section 7a.
-   - **Logging:** `self.result_logger.write_nvtest_log(...)` writes the `.log` file, with
-     `filename_stem` set to the source file's own basename (not the free-text `TEST` name —
-     see Section 10), and `loop_infos` carrying per-command loop/parallel metadata (`None` for
-     any command with `loop_count == 1` and no parallel group, rendering exactly as before).
-   - Returns an `NvtestResult` (`name`, `status`, `log_path`, `validation_lines`,
-     `source_path`).
-   - Any exception (`UnsupportedFileTypeError`, `ParseError`, `VariableError`, or any other
-     `Exception`) is caught **inside `run_targets()`**, not inside `TestRunner.run()` — a
-     target's failure becomes an `"ERROR"` row and the loop continues to the next target.
-8. **`print_summary(rows, test_runner.log)`** — formats the `label / STATUS` table and
-   `Total`/`Passed`/`Failed` counts, all emitted via `test_runner.log.result_line()` (→
-   `FrameworkLogger.info()`), never `print()`.
-9. **Exit code:** `cli._run_cli()` returns `1` if any row's status isn't `"PASS"`, else `0`
-   (`cli.main()` itself can also return `2` for a path/config error before any tests run).
-10. **`cli.main()`**'s `finally` block calls `test_runner.close()` →
-    `self.log.close()` (`FrameworkLogger.close()`), detaching and closing its handlers.
-11. **`run.py`**'s `sys.exit(...)` propagates the returned code as the process exit code.
-
----
-
-## 4. Class Responsibilities
-
-| Class | Responsibility | Inputs | Outputs | Used By |
-|---|---|---|---|---|
-| `TestRunner` | Owns one execution's shared state and orchestrates parse→execute→validate→log per file | `ConfigManager`, `variables_path`; then a `.nvtest` path per `run()` call | `NvtestResult` per `run()` call | `cli.py`, `run.py` (both directly and via `run_nvtest_file()`) |
-| `TestParser` | Wraps `.nvtest` parsing | file path or raw text | `TestCase` | `TestRunner`, `cli.dry_run_targets()` |
-| `CommandExecutor` | Runs one shell command | command string, optional timeout | `CommandResult` | `TestRunner` |
-| `Validator` | Runs all validations for a test | `TestCase`, `List[CommandResult]` | `(List[ValidationResult], all_passed: bool)` | `TestRunner` |
-| `ResultLogger` | Writes a test's `.log` file | test name, `CommandResult`s, binary flags, validation lines, status | path to the written `.log` | `TestRunner` |
-| `FrameworkLogger` | Console + `run.log` diagnostics | level, run dir | log calls (`info`/`debug`/`warning`/`error`/`result_line`) | `TestRunner`, `cli.py` |
-| `ConfigManager` | Loads/exposes config | optional YAML path | `.log_directory`, `.log_level`, `.command_timeout`, `.variables_file` properties | `TestRunner`, `cli.main()` |
-| `VariableManager` | Loads/substitutes variables | JSON path | substituted strings, or raises `VariableError` | `TestRunner`, `Validator` |
-
----
-
-## 5. `.nvtest` Parser
-
-```
-.nvtest file (text)
-      |
-      v
-parse_text()/parse_file()  -- line-by-line, single pass, no lookahead
-      |
-      v
-  per non-blank, non-comment line:
-      strip() -> shlex.split() -> dispatch on tokens[0] (the keyword)
-      |
-      v
-TestCase(name, commands: List[str], validations: List[Validation], source_path,
-          loop_counts: List[int], parallel_group_id: List[Optional[int]],
-          capture_names: List[Optional[str]])
-```
-
-**Parsing flow (`framework/parser.py: parse_text()`):**
-- Iterates `text.splitlines()` with 1-based line numbers.
-- Blank lines and lines starting with `#` (after `.strip()`) are skipped entirely.
-- Once `END` has been seen, any further non-blank/non-comment line raises `ParseError("no
-  statements are allowed after END", ...)`.
-- Each line is tokenized with `shlex.split(line, posix=True)` — this is what makes
-  `"quoted values with spaces"` and embedded single quotes work correctly.
-- The first token dispatches to one of: `TEST`, `RUN`, `PARALLEL`, `END_PARALLEL`,
-  `EXPECT_EXIT`, `EXPECT`, `EXPECT_STDERR`, `EXPECT_BYTE`, `EXPECT_HEX`, `EXPECT_REGEX`,
-  `EXPECT_REGEX_STDERR`, `END`. Anything else raises `ParseError(f"unknown statement
-  {keyword!r}", ...)`.
-
-**Structural validation performed inline, not as a second pass:**
-- `TEST` must be the very first statement (`statements_seen != 1` check) and must appear
-  exactly once.
-- `RUN` must come after `TEST`.
-- `RUN "<command>" [LOOP <n>] [CAPTURE <name>]` — after the mandatory `RUN`/command tokens,
-  any remaining tokens must come in `(modifier, value)` pairs (`(len(tokens) - 2) % 2 == 0`).
-  Each pair's modifier must be `LOOP` or `CAPTURE`, each may appear at most once, and they can
-  appear in either order. `LOOP`'s value is parsed via `_parse_int_maybe_hex()` (must be `>=
-  1`); `CAPTURE`'s value must match `_CAPTURE_NAME_RE` (`[A-Za-z0-9_]+`) — the same charset
-  `{{name}}` placeholders use. `loop_counts.append(1)` / `capture_names.append(None)` when the
-  corresponding modifier is absent, keeping both lists the same length/order as `commands` at
-  all times.
-- `PARALLEL` opens a block: `in_parallel` must be `False` (no nesting), and a fresh
-  `current_parallel_group` id (`next_parallel_group`, a simple incrementing counter) is
-  assigned. Every `RUN` parsed while `in_parallel` is `True` gets that id appended to
-  `parallel_group_id` (`None` for any `RUN` outside a `PARALLEL` block) and increments
-  `parallel_group_run_count`.
-- `END_PARALLEL` closes the block: raises if `not in_parallel` (no matching `PARALLEL`), and
-  raises if `parallel_group_run_count < 2` (a `PARALLEL` block must contain at least 2 `RUN`
-  statements) — this check fires at `END_PARALLEL`, using `parallel_block_start_line` (the
-  `PARALLEL` line's number) for the error, since that's the line the mistake conceptually
-  belongs to.
-- `END` (the file's real ending statement) raises `ParseError("missing END_PARALLEL before
-  END", ...)` if `in_parallel` is still `True` — an unclosed `PARALLEL` block is caught the
-  moment `END` is reached, not only at end-of-file.
-- Every `EXPECT*`/`EXPECT_STDERR`/`EXPECT_REGEX*` keyword requires `current_run_index != -1`
-  (i.e., at least one `RUN` must have already been seen) — this is how "validation binds to
-  the nearest preceding RUN" is implemented, and it works identically whether that `RUN` is
-  inside a `PARALLEL` block or not: `current_run_index` is simply updated to `len(commands) -
-  1` every time a `RUN` line is processed, and every subsequent `Validation` object is stamped
-  with whatever `current_run_index` currently holds.
-- After the loop: `test_name is None`, `not commands`, `in_parallel` (still open), and `not
-  end_seen` are checked and raise `ParseError` for missing `TEST`, missing `RUN`, an unclosed
-  `PARALLEL` block, and missing `END` respectively.
-
-**`EXPECT` vs `EXPECT_STDERR`:** both keywords share one grammar helper,
-`_parse_text_expect(tokens, i, raw_line, keyword, kind_prefix, current_run_index, stream,
-validations)` — the only difference between the two call sites in `parse_text()` is the
-`stream` argument (`"stdout"` for `EXPECT`, `"stderr"` for `EXPECT_STDERR`), which is stored on
-the resulting `Validation.stream` field and read by `validator.check_validation()` to pick
-`result.stdout_text()` vs `result.stderr_text()`.
-
-**`EXPECT_REGEX` / `EXPECT_REGEX_STDERR`:** one shared `elif keyword in ("EXPECT_REGEX",
-"EXPECT_REGEX_STDERR"):` branch handles both — `tokens` must be exactly `["EXPECT_REGEX(_STDERR)",
-"<pattern>"]`, and the pattern is compiled with `re.compile(pattern)` immediately (wrapped in a
-`try/except re.error`, raising `ParseError` with the underlying `re.error` message on failure)
-so a malformed regex is caught at parse time, before any command ever runs. The resulting
-`Validation(kind=REGEX, pattern=pattern, stream=...)` stores the raw, unsubstituted pattern
-string — `{{variable}}` placeholders inside it are resolved later, at validation time, by
-`validator.check_validation()`/`describe_validation()`, not here.
-
-**Internal representation:** `TestCase` (name, `commands: List[str]`, `validations:
-List[Validation]`, `source_path`, `loop_counts: List[int]`, `parallel_group_id:
-List[Optional[int]]`, `capture_names: List[Optional[str]]`) and `Validation` (kind,
-`run_index`, `line_no`, `stream` (`"stdout"` or `"stderr"`), plus kind-specific optional
-fields: `expected_exit`, `field`/`value`, `offset`/`expected_byte`/`hex_string`, `pattern`).
-Both are plain `@dataclass`es — no methods beyond what `@dataclass` auto-generates. `kind` is
-one of the module-level string constants `EXIT`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`,
-`TEXT_NOT_EMPTY`, `BYTE`, `HEX`, `REGEX` — these are internal only, never surfaced to the test
-author (`EXPECT`/`EXPECT_STDERR` produce the same `kind` values distinguished only by
-`stream`; likewise `EXPECT_REGEX`/`EXPECT_REGEX_STDERR` both produce `kind=REGEX`).
-
-**Error handling:** every rejection path raises `parser.ParseError`, a subclass of `Exception`
-that prepends `"line N: "` and appends the offending raw line (`\n    > <line>`) to the
-message when a line number is available. `runner.check_extension()` is a **separate**
-function, called before parsing is ever attempted, so a `.yaml` file is never handed to the
-parser at all.
-
----
-
-## 6. TestCase Model
-
-```
-TestCase
- ├── name: str                       (from TEST "...")
- ├── commands: List[str]             (one per RUN "...", in order)
- ├── validations: List[Validation]   (in declared order)
- │    └── Validation
- │         ├── kind: str             (EXIT / TEXT_CONTAINS / TEXT_NOT_CONTAINS /
- │         │                          TEXT_NOT_EMPTY / BYTE / HEX / REGEX)
- │         ├── run_index: int        (index into `commands` this validation is bound to)
- │         ├── line_no: int
- │         ├── stream: str           ("stdout" for EXPECT/EXPECT_REGEX, "stderr" for
- │         │                          EXPECT_STDERR/EXPECT_REGEX_STDERR)
- │         └── kind-specific fields  (expected_exit | field+value | offset+expected_byte |
- │                                    offset+hex_string | pattern)
- ├── source_path: Optional[str]
- ├── loop_counts: List[int]          (same length/order as `commands`; 1 unless LOOP <n>)
- ├── parallel_group_id: List[Optional[int]]  (same length/order as `commands`; None for a
- │                                              normal RUN, or a shared int for every RUN
- │                                              inside the same PARALLEL block)
- └── capture_names: List[Optional[str]]  (same length/order as `commands`; None unless that
-                                            RUN used CAPTURE <name>)
-```
-
-There is no separate "steps" or "result" substructure — commands and validations are two
-parallel flat lists linked only by `Validation.run_index`. This is deliberately simpler than
-the `steps: [{command, validations}]` shape one might expect; it was chosen because it lets
-`TestRunner.run()` iterate command indices generically (sequential execution for `LOOP`-only
-commands, `ThreadPoolExecutor`-submitted for commands sharing a `parallel_group_id`) rather
-than needing a richer nested tree. `loop_counts`/`parallel_group_id`/`capture_names` are three
-more flat lists in that same shape, extended this way (rather than folding them into
-`Validation` or introducing a new `Command` dataclass) specifically so the existing
-`run_index`-based binding logic needed no changes at all when these features were added.
-
----
-
-## 7. Command Execution
-
-`framework/executor.py: CommandExecutor`:
-
-- **Subprocess usage:** `subprocess.run(command, shell=True, stdout=subprocess.PIPE,
-  stderr=subprocess.PIPE, timeout=timeout)`. `shell=True` is used unconditionally by every
-  caller in this codebase (the `shell: bool = True` parameter exists but nothing sets it to
-  `False`).
-- **stdout/stderr:** captured as raw `bytes` (`proc.stdout`/`proc.stderr`), never decoded at
-  this layer.
-- **Return code:** `proc.returncode`, stored verbatim in `CommandResult.exit_code`.
-- **Timeout:** `CommandExecutor.__init__(default_timeout=...)` stores a default (normally
-  wired from `ConfigManager.command_timeout`); `run(..., timeout=None)` falls back to that
-  default if no explicit value is passed for that call. On `subprocess.TimeoutExpired`,
-  `exit_code` is set to `-1` and `[TIMEOUT after {timeout}s]` is appended to stderr — the
-  command isn't retried.
-- **Errors:** `FileNotFoundError` → `exit_code = 127`; other `OSError` → `exit_code = 1`; both
-  populate `stderr` with the exception text and return a normal `CommandResult` rather than
-  raising — callers never need a `try/except` around `.run()`.
-- **`CommandResult`** (`@dataclass`): `command`, `exit_code`, `stdout: bytes`, `stderr:
-  bytes`, `start_time`, `end_time`, plus a `duration` property and `stdout_text()`/
-  `stderr_text()` helper methods (UTF-8 decode with `errors="replace"`).
-
----
-
-## 7a. Loop & Parallel Execution
-
-`TestRunner.run()` (`framework/runner.py`) implements `LOOP <n>` and `PARALLEL` entirely at the
-orchestration layer — `CommandExecutor` itself has no concept of looping or concurrency; it
-only ever runs one command once per call, exactly as before this feature existed.
-
-```
-for each command index i (0..n-1), in file order:
-    if parallel_group_id[i] is None:
-        execute_slot(i)                          # sequential, in the main thread
-    else:
-        group = [j for j in range(n)
-                 if parallel_group_id[j] == parallel_group_id[i] and not executed[j]]
-        submit execute_slot(j) for every j in group to a ThreadPoolExecutor
-        wait for all of them (future.result()) before continuing past the group
-
-execute_slot(i):
-    cmd = self.variable_manager.substitute(test_case.commands[i])   # JIT, see below
-    for iteration in 1..loop_counts[i]:
-        result = self.executor.run(cmd)          # one real CommandExecutor.run() call
-        for v in validations bound to index i:
-            passed, message = check_validation(v, result, self.variable_manager)
-            update per-validation pass/fail counts, last_message, first_failure_by_vid
-    results[i] = the LAST iteration's CommandResult
-    if capture_names[i]: self.variable_manager.set(capture_names[i], results[i].stdout_text().strip())
-    loop_infos[i] = None if loop_count == 1 and not parallel, else a summary dict
-```
-
-**Why substitution happens per-command, not all upfront:** an earlier version substituted
-every command's `{{...}}` placeholders in one list comprehension before any command executed
-at all. `RUN ... CAPTURE <name>` broke that assumption — a later `RUN` might reference a
-`{{name}}` that only exists *after* an earlier `RUN` has actually run. `execute_slot(i)` now
-calls `self.variable_manager.substitute(test_case.commands[i])` itself, right before that
-command's own iterations begin, so by the time a later index's substitution runs, any earlier
-index's `CAPTURE` (sequential order) has already landed in `self.variable_manager`. The
-tradeoff: an unresolved `{{name}}` in command 3 is no longer caught before command 1 runs —
-it's only discovered once execution reaches command 3, meaning commands 1 and 2 (and any real
-side effects) will already have happened. This is documented in `run()`'s docstring and in
-USER_GUIDE.md's Section 10c as an accepted, necessary consequence of supporting `CAPTURE` at
-all — there is no way to know an unbound `{{name}}` will fail without either running the
-capturing command first, or building a separate static dependency-order checker (deliberately
-not built, to avoid a second, parallel notion of "will this resolve" that could drift from
-actual runtime behavior).
-
-**Capturing (`capture_names[i]`):** after `execute_slot(i)`'s loop finishes, if that index used
-`CAPTURE <name>`, `self.variable_manager.set(name, last_result.stdout_text().strip())` stores
-it. This happens strictly after all of that RUN's own iterations and validations are done — a
-RUN's own bound `EXPECT*` lines never see their own RUN's capture, only a *later* RUN/EXPECT
-can. `VariableManager.set()` simply overwrites/adds into the same dict `get()`/`substitute()`
-read from, so a captured variable is indistinguishable from a `common_variables.json` one to
-every downstream consumer (`check_validation()`, `describe_validation()`, the next
-`execute_slot()` call).
-
-**Why per-iteration validation, not "run everything, then validate":** `check_validation()` is
-called immediately after each iteration's `CommandExecutor.run()`, inside the same loop —
-`CommandResult`s are not accumulated in memory across iterations (only the pass/fail tallies
-and the single most-recent `CommandResult` are kept). This bounds memory usage at O(1) per
-command regardless of `LOOP` count, rather than O(n) for n iterations of potentially large
-captured stdout.
-
-**Why `ThreadPoolExecutor`, not `multiprocessing` or `asyncio`:** every command ultimately runs
-via `subprocess.run()`, which releases the GIL while the child process executes — threads are
-sufficient to get genuine wall-clock overlap between concurrently-running commands (confirmed:
-two 10x-looped `sleep 0.05` commands in one `PARALLEL` block complete in ~0.5s, vs. ~1.0s run
-sequentially). No new dependency was introduced — `concurrent.futures` is stdlib.
-
-**Thread-safety of what's shared across threads:**
-- `CommandExecutor.run()` — safe to call concurrently; each call is an independent
-  `subprocess.run()`, and the only instance state (`self.default_timeout`) is a read-only
-  `int` set once at construction.
-- `check_validation()`/`describe_validation()` — pure functions with no shared mutable state.
-- `FrameworkLogger` — backed by Python's stdlib `logging`, whose handlers are internally
-  lock-protected; `self.log.info("Running PARALLEL group ...")` is called once from the main
-  thread before submitting a group (not from inside `execute_slot()`), so per-iteration logging
-  contention/interleaving was avoided by design rather than needing to rely on `logging`'s
-  thread-safety at all.
-- `results`/`loop_infos`/`per_index_validation_data` (plain `list`s in `TestRunner.run()`) —
-  each thread in a group only ever writes to its own distinct index; concurrent writes to
-  different indices of the same Python list need no additional locking (CPython's GIL makes
-  each individual `list.__setitem__` atomic, and there is no overlap between which indices
-  different threads write to).
-- `VariableManager` — `get()`/`set()`/`load()` each hold `self._lock` (a plain
-  `threading.Lock`) around their dict access, since `PARALLEL` makes concurrent
-  reads (`substitute()` during another RUN's JIT substitution) and writes (`CAPTURE`) to the
-  same `VariableManager` genuinely possible. `substitute()` itself does not hold the lock for
-  its whole regex pass -- it calls `self.get()` once per `{{name}}` match, each such call
-  independently locked -- so it does not provide snapshot-consistent atomicity across a single
-  substitution if another thread races a `set()` mid-substitution, but each individual
-  name's value is never read torn/partially-written. Two `RUN`s in the same `PARALLEL` block
-  should not `CAPTURE` into the *same* name (documented in USER_GUIDE.md as a "don't do this"
-  rather than prevented outright); if they do, the lock prevents corruption but not a
-  last-write-wins race on which value ends up stored.
-
-**First-failure tracking, at two granularities:** `execute_slot()` tracks
-`first_failure_by_vid` — the first iteration each *individual* bound validation failed on
-(used for that validation's own aggregate message) — separately from the command block's
-single `loop_infos[i]["first_failure"]`, which is the earliest failure across *any* bound
-validation for that command (used for the `.log`'s one `FIRST FAILURE:` line per command
-block). If a command has two bound validations that fail on different iterations, each gets
-its own accurate "first failure at iteration N" in its own `[FAIL]` line, while the command
-block shows whichever of the two failed earliest overall.
-
-**Backward compatibility guarantee:** for any `.nvtest` file that uses no `LOOP`/`PARALLEL`
-(every `loop_counts[i] == 1` and every `parallel_group_id[i] is None`), `execute_slot()`
-degenerates to exactly one iteration with no aggregation needed — `last_message[id(v)]` *is*
-the single check's message, `loop_infos[i]` stays `None`, and both the `.log` rendering and the
-`NvtestResult`/CLI-visible behavior are byte-for-byte identical to before this feature existed.
-This was verified directly: the full pre-existing regression suite (all checks predating
-LOOP/PARALLEL) still passes unchanged.
-
----
-
-## 8. Binary Data Handling
-
-```
-nvme admin-passthru / io-passthru (or any command)
-        |
-        v
-  subprocess.run(..., stdout=subprocess.PIPE)  -- captured as raw bytes, no text assumption
-        |
-        v
-  CommandResult.stdout: bytes                  -- untouched, exactly what the process wrote
-        |
-        v
-  Validator (framework/validator.py): BYTE/HEX validations index directly into
-  `result.stdout` (e.g. `data[v.offset]`, `data[v.offset:v.offset+len(expected)]`)
-        |
-        v
-  utility.hex_dump(result.stdout) -- called only by logger.py, only for DISPLAY,
-        |                            strictly after validation has already happened
-        v
-  .log file's "BINARY OUTPUT:" section
-```
-
-**Why validation operates on raw bytes, not the formatted dump:** the hex dump is produced by
-`logger._render_command_block()` calling `utility.hex_dump()`, which is invoked from
-`ResultLogger.write_nvtest_log()` — a completely separate code path from
-`Validator.validate()`. The validator never imports or calls anything from `logger.py`. This
-means the hex-dump text format (column widths, ASCII sidebar, etc.) could change freely without
-ever affecting what a test actually checks — validation always operates on `CommandResult.stdout`
-directly.
-
-**Which `RUN` blocks get hex-dumped:** decided in `TestRunner.run()`, not in the logger —
-`binary_flags[v.run_index] = True` for every `Validation` whose `kind` is `"BYTE"` or `"HEX"`.
-A `RUN` with no bound binary validation is always rendered as text, even if its output happens
-to be binary garbage (it will simply decode with `errors="replace"`).
-
-**No `.bin` files:** confirmed by direct inspection — `logger.py` has exactly one file-write
-call per test (`open(log_path, "w", ...)`), and nothing anywhere in the codebase writes a
-second file per test. Re-verified live by running the full suite and searching for `.bin`
-files afterward.
-
----
-
-## 9. Validation Architecture
-
-`framework/validator.py`:
-
-- **`check_validation(v, result, variable_manager=None) -> (bool, str)`** — the actual
-  per-kind comparison logic (all seven kinds: `EXIT`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`,
-  `TEXT_NOT_EMPTY`, `BYTE`, `HEX`, `REGEX`, as one `if`/`elif` chain) against a **single**
-  `Validation` and a **single** `CommandResult`. This is the one place stream selection happens
-  for text/regex validations: `text = result.stderr_text() if v.stream == "stderr" else
-  result.stdout_text()`. Public (no leading underscore) specifically so `TestRunner.run()` can
-  call it directly, once per loop iteration, for a `LOOP > 1` `RUN` — see Section 3/14.
-  The `REGEX` branch substitutes `v.pattern` via `variable_manager` (if given) before calling
-  `re.search()`, wrapped in `try/except re.error` — a pattern that compiled fine at parse time
-  (before substitution) could still become invalid after a variable's value is inserted; that
-  case fails the validation with a clear message rather than raising out of `check_validation()`.
-- **`validate(test_case, results, variable_manager=None)`** — the `LOOP == 1` path: a thin
-  loop over `test_case.validations` calling `check_validation()` exactly once per validation,
-  collecting `(bool, str)` pairs and an overall `all_passed`. This function's behavior and
-  output are **identical** to before the LOOP/PARALLEL feature existed — nothing at this layer
-  changed for an ordinary, non-looped `.nvtest` file.
-- **`Validator.validate()`** — thin class wrapper around `validate()`, converting its raw
-  tuples into `ValidationResult` (`@dataclass`: `passed: bool`, `message: str`). Still
-  constructed and available on every `TestRunner` as `self.validator`, but `TestRunner.run()`
-  itself now calls `check_validation()` directly rather than `self.validator.validate()`,
-  because a looped `RUN`'s aggregation (per-iteration counting, first-failure tracking) needs
-  finer-grained control than `validate()`'s "one CommandResult per command" shape provides.
-- **`describe_validation(v, variable_manager=None) -> str`** — a human-readable label for a
-  `Validation` with no `CommandResult` involved at all (e.g. `'Exit code == 0'`, `'"Model
-  Number" contains "Samsung"'`). Used only by `TestRunner.run()` to build the aggregate
-  `"<label> across N iterations: X passed, Y failed"` message for a `LOOP > 1` `RUN` — there's
-  no single `CommandResult` to hand `check_validation()` for "the whole loop," so the label and
-  the pass/fail counts are assembled separately. Deliberately duplicates the small "base
-  description" fragments already inside `check_validation()` rather than threading a
-  "label-only" mode through that function's signature, keeping `check_validation()` simple and
-  single-purpose.
-- **Failure handling:** there is no early return or short-circuiting anywhere in `validate()`
-  or in `TestRunner.run()`'s per-iteration loop — every validation is checked against every
-  iteration, and `all_passed`/per-validation fail counts accumulate rather than breaking on the
-  first `False`.
-
-**Adding a new validator** (see also Section 17) means adding a new branch to
-`check_validation()`'s `if`/`elif` chain, a matching branch to `describe_validation()` (so
-`LOOP`ed usage of the new validator reports a sensible aggregate label), plus a new kind
-constant in `parser.py` and new parsing logic there to recognize its syntax.
-
----
-
-## 10. Logger Architecture
-
-There are **two distinct loggers** in this codebase — do not confuse them:
-
-| | `ResultLogger` (`logger.py`) | `FrameworkLogger` (`framework_log.py`) |
+| Module | Owns | Key names |
 |---|---|---|
-| Purpose | Formats one **test's** COMMAND/OUTPUT/VALIDATION into its `.log` | Framework diagnostics + CLI result output |
-| Backing | Hand-built string formatting, plain file write | Python stdlib `logging` module |
-| Levels | None — it's a fixed report format | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
-| Output | One file per test (`<stem>.log`) | Console (`stdout`) + one `run.log` per run directory |
-| Alias | `Logger = ResultLogger` (backward compat) | none |
+| `parser.py` | `.nvtest` grammar only | `ParseError`, `Validation`, `TestCase`, `TestParser`, `parse_text`/`parse_file` |
+| `executor.py` | one `subprocess.run()` call | `CommandResult`, `CommandExecutor` (alias `Executor`) |
+| `validator.py` | per-validation comparison | `check_validation`, `describe_validation`, `validate`, `Validator`, `ValidationResult` |
+| `runner.py` | orchestration; only module importing all others | `TestRunner`, `NvtestResult`, `check_extension`, `UnsupportedFileTypeError`, `run_nvtest_file` |
+| `logger.py` | `.log` file formatting | `ResultLogger` (alias `Logger`) |
+| `framework_log.py` | console + `run.log` diagnostics | `FrameworkLogger` |
+| `config_manager.py` | YAML load + defaults | `ConfigManager` |
+| `variable_manager.py` | JSON load + `{{name}}` substitution + runtime capture | `VariableManager`, `VariableError` |
+| `utility.py` | generic helpers, no test/NVMe semantics | `hex_dump`, `safe_filename`, `format_timestamp`, `new_run_id`, `parse_int_maybe_hex` |
+| `cli.py` | argparse + discovery + reporting | `CliTarget`, `build_arg_parser`, `discover_targets`, `run_targets`, `dry_run_targets`, `print_summary`, `main` |
 
-**`FrameworkLogger`** (`framework/framework_log.py`):
-- Wraps `logging.getLogger(unique_name)` where `unique_name = f"{name}.{uuid.uuid4().hex}"` —
-  **every instance gets a unique underlying logger name**, specifically to avoid two live
-  `TestRunner`s (and thus two live `FrameworkLogger`s) from sharing/clobbering each other's
-  handlers via the stdlib logging registry. This was a fixed defect (see Section 24); do not
-  revert to a fixed/shared name.
-- One `StreamHandler` (console, level from `--log-level`/config) and, if `run_dir` is given,
-  one `FileHandler` writing `run.log` inside it (always at `DEBUG`, regardless of the console
-  level).
-- `close()` removes and closes all handlers — call this when a `TestRunner`/`FrameworkLogger`
-  is done being used, to avoid leaking file descriptors. `TestRunner.close()` delegates to it.
-- `result_line()` is just `self.info()` under a different name, used specifically for
-  CLI table/summary output so its purpose is clear at call sites in `cli.py`.
+`TestCase`: `name`, `commands: List[str]`, `validations: List[Validation]`, `source_path`,
+`loop_counts: List[int]` (1 unless `LOOP <n>`), `parallel_group_id: List[Optional[int]]`
+(shared int per `PARALLEL` block, else `None`), `capture_names: List[Optional[str]]`.
+`Validation`: `kind`, `run_index`, `line_no`, `stream` (`stdout`/`stderr`), plus kind-specific
+fields (`expected_exit` | `field`/`value` | `offset`+`expected_byte` | `offset`+`hex_string` |
+`pattern`). All flat lists indexed by `run_index`/command index — no nested step tree.
 
-**Avoiding direct `print()`:** the only `print()` call left anywhere in `framework/` is in
-`cli.main()`, for a `ConfigManager` construction failure — deliberately, because that happens
-*before* a `TestRunner`/`FrameworkLogger` can exist at all. Every other status/result/error
-message in the framework goes through a `FrameworkLogger` method.
+## 3. `.nvtest` Parser
 
-**Adding a new log message correctly:** call `self.log.debug(...)` / `.info(...)` /
-`.warning(...)` / `.error(...)` on the `FrameworkLogger` instance you already have access to
-(`TestRunner.log`, or the `test_runner.log` passed into `cli.py`'s helper functions) — never
-add a bare `print()`.
+Single pass, line-by-line, 1-based line numbers; `shlex.split(line, posix=True)` per line;
+dispatch on `tokens[0]`. Keywords: `TEST`, `RUN`, `PARALLEL`, `END_PARALLEL`, `EXPECT_EXIT`,
+`EXPECT`, `EXPECT_STDERR`, `EXPECT_BYTE`, `EXPECT_HEX`, `EXPECT_REGEX`,
+`EXPECT_REGEX_STDERR`, `END`.
 
-**Note on `ResultLogger` and loop/parallel rendering:** `_render_command_block()`
-(`framework/logger.py`) takes an optional `loop_info` dict; when `None` (every `.nvtest` file
-that doesn't use `LOOP`/`PARALLEL`), rendering is byte-for-byte identical to before that
-feature existed. When given, it adds `LOOP COUNT:`/`PARALLEL GROUP:`/`ITERATIONS RUN:`/`FIRST
-FAILURE:` lines and relabels `EXIT CODE:`/`OUTPUT:` to `EXIT CODE (last iteration):`/`OUTPUT
-(last iteration):`, since `result` in that case is the *last* iteration's `CommandResult`, not
-the only one. This is a `ResultLogger` (per-test `.log`) concern, entirely separate from
-`FrameworkLogger` — `TestRunner.run()` never logs per-iteration progress via `FrameworkLogger`
-(see Section 7a's thread-safety notes for why).
+- `RUN "<cmd>" [LOOP <n>] [CAPTURE <name>]`: modifiers parsed as `(keyword, value)` pairs after
+  token 2; either order, each at most once. `LOOP` value via `parse_int_maybe_hex` (`>=1`);
+  `CAPTURE` value must match `[A-Za-z0-9_]+`.
+- `PARALLEL`: rejects nesting (`in_parallel` flag); assigns an incrementing group id to every
+  `RUN` until `END_PARALLEL`, which requires `>= 2` RUNs seen. `END` raises if a `PARALLEL`
+  block is still open.
+- `current_run_index` = index of the most recent `RUN`; every `EXPECT*` requires it `!= -1` —
+  this is the entire "bind to nearest preceding RUN" mechanism, including inside `PARALLEL`.
+- `EXPECT`/`EXPECT_STDERR` share `_parse_text_expect(...)`, differing only in `stream`.
+- `EXPECT_REGEX[_STDERR]`: pattern is `re.compile()`d immediately; `re.error` → `ParseError`.
+- Missing `TEST`/`RUN`/`END`/unclosed `PARALLEL` are checked after the line loop.
+- `runner.check_extension()` rejects non-`.nvtest` paths **before** parsing is ever attempted.
 
----
+## 4. Command Execution & Binary Handling
 
-## 11. Configuration Architecture
+`CommandExecutor.run(cmd, timeout=None)` → `subprocess.run(cmd, shell=True, stdout=PIPE,
+stderr=PIPE, timeout=timeout or self.default_timeout)`. Always returns a `CommandResult`
+(`command`, `exit_code`, `stdout: bytes`, `stderr: bytes`, `start_time`, `end_time`) — never
+raises for a failed/missing/timed-out command (`TimeoutExpired`→exit `-1` + `[TIMEOUT
+after Ns]`; `FileNotFoundError`→127; other `OSError`→1). No NVMe/FIO-specific branching
+anywhere — a command is just a string.
 
-```
-YAML file (optional, via --config)
-      |
-      v
-ConfigManager.__init__()  -- yaml.safe_load() -> _merge() over a deep copy of _DEFAULTS
-      |
-      v
-ConfigManager.log_directory / .log_level / .command_timeout / .variables_file  (properties)
-      |
-      v
-TestRunner (reads all four properties at construction time)
-      |
-      v
-FrameworkLogger(level=...), VariableManager(path from .variables_file),
-CommandExecutor(default_timeout=...), ResultLogger(log_dir=<run_dir built from
-.log_directory>)
-```
+Binary flow: raw `stdout`/`stderr` bytes are never decoded until `stdout_text()`/
+`stderr_text()` is called. `check_validation()`'s `BYTE`/`HEX` branches index `result.stdout`
+directly. `logger._render_command_block()` calls `utility.hex_dump()` **only for display**,
+strictly after validation. Whether a command's block is hex-dumped is decided in
+`TestRunner.run()`: `binary_flags[v.run_index] = True` for any bound `BYTE`/`HEX` validation.
+No `.bin` file is ever written (one `open(log_path, "w")` call per test, full stop).
 
-- **Loading:** `ConfigManager(config_path=None)` — if `config_path` is falsy, no file I/O
-  happens at all; `self._data` is just a deep copy of the module-level `_DEFAULTS` dict. If a
-  path is given, it must exist (`FileNotFoundError` otherwise) and `yaml` must be importable
-  (`RuntimeError` otherwise); the loaded YAML is merged over the defaults with `_merge()`,
-  which does a **shallow per-section merge** — e.g. providing only `framework: {log_level:
-  DEBUG}` in your YAML still keeps the default `log_directory`, because `_merge()` calls
-  `base[section].update(values)` per top-level section rather than replacing the whole
-  section wholesale.
-- **Defaults:** the module-level `_DEFAULTS` dict in `config_manager.py` — currently
-  `log_directory="logs"`, `log_level="INFO"`, `command_timeout=300`,
-  `variables.file="common_variables.json"`.
-- **Validation:** none beyond what `yaml.safe_load()` itself does — there is no schema check;
-  a YAML file with an unexpected key/type is accepted as-is and will surface as a runtime
-  error wherever that value is actually used (e.g. a non-numeric `command_timeout` would fail
-  inside `subprocess.run(timeout=...)`).
-- **Precedence:** built-in defaults < YAML file values (when `--config` is passed) < CLI flags
-  that explicitly override a config value at a narrower scope (currently only `--log-level`,
-  which overrides `log_level` for console output only, after `TestRunner` construction, via
-  `test_runner.log.set_level(...)`).
-- **Not auto-loaded:** `config/config.yaml` shipping in the repository does **not** mean it's
-  read by default — `ConfigManager()` with no argument (the default path throughout
-  `TestRunner`/`run.py`) never touches the filesystem for config. This is intentional (see
-  the file's own header comment) rather than a bug — see Section 24 for the reasoning behind
-  not adding auto-discovery.
+## 5. Validator Architecture
 
-**Adding a new configuration option:**
-1. Add the key (with its default) to `_DEFAULTS` in `config_manager.py`.
-2. Add a `@property` on `ConfigManager` exposing it.
-3. Read that property wherever the value is needed (typically in `TestRunner.__init__`).
-4. Add the field to `config/config.yaml`'s example content and its header-comment table in the
-   User Guide.
+- `check_validation(v, result, variable_manager=None) -> (bool, str)`: the only per-kind
+  comparison logic, one `if`/`elif` chain over `EXIT`/`TEXT_CONTAINS`/`TEXT_NOT_CONTAINS`/
+  `TEXT_NOT_EMPTY`/`BYTE`/`HEX`/`REGEX`. Substitutes `v.value`/`v.pattern` via
+  `variable_manager` first. `REGEX` wraps `re.search()` in `try/except re.error` (a
+  substituted pattern can become invalid at runtime even if it compiled at parse time).
+- `validate(test_case, results, variable_manager=None)`: thin loop over
+  `check_validation()`, one call per validation — the `LOOP == 1` path, unchanged output shape.
+- `Validator.validate()`: wraps `validate()` into `ValidationResult` objects. Still
+  constructed on every `TestRunner` (`self.validator`) but **not called** by `TestRunner.run()`
+  — looped aggregation needs per-iteration control `validate()`'s shape doesn't provide.
+- `describe_validation(v, variable_manager=None) -> str`: label with no `CommandResult`
+  involved (`"Exit code == 0"`, etc.), used only to build a `LOOP>1` aggregate message.
+  Deliberately duplicates `check_validation()`'s base-description strings rather than adding a
+  label-only mode to that function.
+- No short-circuiting anywhere: every validation checked, every iteration, always.
 
----
+**Add a validator:** new kind constant in `parser.py` + parsing branch → branch in
+`check_validation()` → matching branch in `describe_validation()` → a test file exercising
+pass+fail → update the tables above.
 
-## 12. Variable Architecture
+## 6. Logger Architecture
 
-```
-common_variables.json (or --config-specified variables.file)
-        |
-        v
-VariableManager.load()  -- json.load(), must be a dict, else ValueError
-        |
-        v
-VariableManager.get(name) / .set(name, value) / .substitute(text)
-        |                        ^
-        |                        |
-        v                        |
-TestRunner.run(): execute_slot(i) substitutes test_case.commands[i] JIT, then,
-if capture_names[i], calls vm.set(name, last_result.stdout_text().strip())
-        |
-        v
-check_validation(): value/pattern = vm.substitute(v.value / v.pattern)  (TEXT_CONTAINS, REGEX)
-        |
-        v
-Resolved command string handed to CommandExecutor.run(), or resolved value/pattern
-compared during validation
-```
+Two distinct loggers:
+| | `ResultLogger` | `FrameworkLogger` |
+|---|---|---|
+| Purpose | one test's `.log` | console + `run.log` diagnostics |
+| Backing | hand-built strings, one file write | stdlib `logging` |
+| Levels | none (fixed report) | DEBUG/INFO/WARNING/ERROR |
 
-- **Loading:** `VariableManager(variables_file)` calls `self.load()` in `__init__` if a path
-  is given; `load()` requires the file to exist and to parse as a JSON *object* (a JSON array
-  or scalar raises `ValueError`). Passing `None` (or a nonexistent path) constructs a
-  `VariableManager` with an empty `_values` dict and no error — `TestRunner.__init__` always
-  constructs one, even with nothing to load, specifically so `RUN ... CAPTURE` always has
-  somewhere to store into regardless of whether a variables file exists on disk.
-- **Lookup:** `get(name)` raises `VariableError` if `name` isn't a key in the loaded dict;
-  otherwise returns the raw JSON (or captured) value (str, int, float, bool, list, dict —
-  whatever JSON allows, or whatever `set()` was called with) unmodified.
-- **Runtime capture:** `set(name, value)` stores/overwrites a variable at runtime — this is
-  the only way a value can enter `_values` outside of `load()`. Used exclusively by
-  `TestRunner.run()`'s `execute_slot()`, once per `RUN` that used `CAPTURE <name>`, with
-  `value` always a `str` (the last iteration's stripped stdout) in current usage, though
-  `set()` itself doesn't enforce that.
-- **Substitution:** `substitute(text)` uses a single compiled regex,
-  `_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")`, matching `{{name}}` (with
-  optional internal whitespace around `name`) and replacing each match with `str(self.get(name))`.
-  It short-circuits (`return text` unchanged) if `"{{"` isn't present at all, avoiding a
-  regex pass on strings with no placeholders.
-- **Thread safety:** `get()`/`set()`/`load()` each acquire `self._lock` (`threading.Lock`)
-  around their read/write of `_values`. Needed because `PARALLEL` makes concurrent
-  `substitute()` (read, via `get()`) and `CAPTURE` (write, via `set()`) calls against the same
-  `VariableManager` instance genuinely possible across threads — see Section 7a.
-- **Supported types:** any valid JSON value can be a variable's value; it's coerced to `str()`
-  only at substitution time, so a variable never *has* to be a string in the JSON file itself.
-- **Missing variables:** `get()`/`substitute()` raise `VariableError` immediately on the first
-  unknown name — there is no partial substitution or default-value fallback. For a
-  `CAPTURE`-dependent reference, this is only ever raised once execution actually reaches the
-  referencing `RUN` (see Section 7a's "JIT substitution" note) — not upfront the way a
-  purely-`common_variables.json`-driven `.nvtest` file's references effectively were before
-  `CAPTURE` existed.
-- **Adding future variable functionality:** any new capability (nested substitution, escaping,
-  a different placeholder syntax) belongs entirely inside `variable_manager.py` — nothing
-  outside it (parser, validator, runner) needs to change as long as `substitute()`'s
-  signature stays the same, since every caller already treats it as an opaque
-  string-in/string-out operation.
+`FrameworkLogger` gives each instance a **unique** `logging.getLogger()` name
+(`f"{name}.{uuid4().hex}"`) — a fixed shared name previously let a second `TestRunner`
+hijack an earlier one's handlers. `close()` removes/closes handlers (avoids fd leak);
+`TestRunner.close()` delegates to it; `cli.main()` calls it in a `finally`.
 
----
+`_render_command_block(result, binary_output, loop_info=None)`: `loop_info=None` (no
+`LOOP`/`PARALLEL`) renders byte-identical to the original format; otherwise adds `LOOP COUNT:`
+/`PARALLEL GROUP:`/`ITERATIONS RUN:`/`FIRST FAILURE:` and relabels `EXIT CODE:`/`OUTPUT:` to
+`(last iteration)`. `write_nvtest_log(..., filename_stem=...)` keys the `.log` filename off the
+**source path's basename**, not the free-text `TEST` name (two files with the same `TEST`
+label must not overwrite each other's log).
 
-## 13. Utility Module
+## 7. Configuration Architecture
 
-`framework/utility.py` — the single common utility module.
+`ConfigManager(config_path=None)`: no path → deep-copies module-level `_DEFAULTS`, no file
+I/O. A path → must exist (`FileNotFoundError`) and `yaml` must import (`RuntimeError`);
+`yaml.safe_load()` result is merged over defaults per-section (`base[section].update(values)`
+— missing keys keep their default). No schema validation. `config/config.yaml` is never
+auto-discovered — deliberate, to avoid implicit CWD/script-relative path behavior.
 
-| Function | Purpose | Input | Output | Example |
-|---|---|---|---|---|
-| `hex_dump(data, bytes_per_line=16)` | Render bytes as a `hexdump -C`-style dump | `bytes` | `str` (multi-line) | `hex_dump(b"\x01\x00")` → `"00000000  01 00 ...  .."` |
-| `safe_filename(name)` | Sanitize a string into a filesystem-safe stem | `str` | `str` (alnum + `-_.` only, everything else → `_`) | `safe_filename("A: B")` → `"A__B"` |
-| `format_timestamp(epoch_seconds)` | Format epoch time for `.log` headers | `float` | `str`, `"%Y-%m-%d %H:%M:%S"` | `format_timestamp(0)` → `"1970-01-01 00:00:00"` (UTC-dependent) |
-| `new_run_id()` | Generate a unique run-directory name | none | `str`, `"YYYYMMDD_HHMMSS_<8-hex>"` | `new_run_id()` → `"20260822_054710_3c2569c1"` |
-| `parse_int_maybe_hex(token)` | Parse decimal or `0x`-prefixed hex | `str` | `int`, or raises `ValueError` | `parse_int_maybe_hex("0x10")` → `16` |
+## 8. Variable Manager
 
-**What belongs here:** generic, string/hex/time helpers used (or reasonably reusable) by more
-than one module, with no `.nvtest`/NVMe-specific meaning.
+`VariableManager(variables_file=None)`: `None`/missing path → empty `_values`, no error —
+always constructed by `TestRunner` so `CAPTURE` has somewhere to write even with no JSON file.
+`get()`/`set()`/`load()` each hold `self._lock` (`threading.Lock`) — needed because `PARALLEL`
+makes concurrent `substitute()` (read) and `CAPTURE` (`set()`, write) genuinely possible.
+`substitute(text)`: regex `\{\{\s*([A-Za-z0-9_]+)\s*\}\}`, short-circuits if `"{{"` absent.
 
-**What does not belong here:** anything that knows about `TestCase`, `Validation`,
-`CommandResult`, `.nvtest` syntax, or NVMe/fio semantics — that logic stays in
-`parser.py`/`validator.py`/`runner.py`.
+## 9. Utility Module
 
-**Avoiding duplication:** both `parser.py` (for `EXPECT_EXIT`/`EXPECT_BYTE`/`EXPECT_HEX`
-integer arguments) and — potentially — any future variable-typing logic should call
-`parse_int_maybe_hex()` rather than reimplementing `int(x, 0)` handling locally.
-`safe_filename`/`format_timestamp`/`hex_dump` are each called from exactly one place today
-(`logger.py`), but live here rather than in `logger.py` because they were duplicated between
-two methods there before being extracted — keeping them in `utility.py` prevents that
-duplication from reappearing if a third caller is added later.
+`hex_dump`, `safe_filename`, `format_timestamp`, `new_run_id` (`YYYYMMDD_HHMMSS_<8-hex-uuid>` —
+a PID suffix was tried first and rejected: it doesn't disambiguate multiple `TestRunner`s in
+one process/second), `parse_int_maybe_hex`. Only generic, reusable, non-test-specific helpers
+belong here.
 
----
+## 10. Run/Log Lifecycle
 
-## 14. Run/Log Lifecycle
+`TestRunner.__init__`: `run_id = new_run_id()`; `run_dir = log_directory/run_id`,
+`os.makedirs(exist_ok=True)`; `FrameworkLogger`/`ResultLogger` both built with this one
+`run_dir`. Generated **once** per `TestRunner`; `cli.main()` builds exactly one `TestRunner`
+per invocation and reuses it for every discovered target — this is the entire mechanism behind
+"one execution = one `logs/{run_id}/`".
 
-```
-python3 run.py tests/
-        |
-        v
-TestRunner.__init__(): self.run_id = utility.new_run_id()
-                        self.run_dir = os.path.join(config.log_directory, self.run_id)
-                        os.makedirs(self.run_dir, exist_ok=True)
-        |
-        v
-logs/YYYYMMDD_HHMMSS_<hex>/           <-- created ONCE, here
-        |
-        v
-Every test_runner.run(path) call for every discovered target writes into
-self.result_logger (constructed with log_dir=self.run_dir) -- same directory,
-same TestRunner instance, for the entire CLI invocation
-        |
-        v
-FrameworkLogger's run.log also lives in this same directory
-```
+## 11. CLI Architecture
 
-The run id is generated **exactly once**, inside `TestRunner.__init__`, and is never
-regenerated for the lifetime of that `TestRunner` instance. `cli.main()` constructs exactly
-one `TestRunner` per invocation and passes it to `run_targets()`/`dry_run_targets()`, which
-iterate every discovered target through that same instance — this is what guarantees "one
-timestamp directory per execution" rather than "one per test." The random 8-hex suffix on
-`new_run_id()` exists specifically so that two `TestRunner`s constructed within the same
-wall-clock second (e.g. two rapid CLI invocations, or two instances in the same process during
-the self-verification harness) never collide on `run_dir`.
+`argparse` (`build_arg_parser`): positional `path`; `--config`, `--log-level`
+(`choices=[DEBUG,INFO,WARNING,ERROR]`), `--dry-run` (`store_true`). `main()` builds
+`ConfigManager` (bare `print()` on failure — the one unavoidable pre-logger case) → one
+`TestRunner` → `discover_targets` → `run_targets`/`dry_run_targets` → `print_summary` →
+`close()`. `run_targets()` catches `UnsupportedFileTypeError`/`ParseError`/`VariableError`
+plus a final `except Exception` (not `BaseException`) so one bad target can't drop the rest of
+a directory batch. Exit `0`/`1`/`2`.
 
----
+**Add a CLI option:** extend `build_arg_parser()`; read `args.<name>` in `main()`/`_run_cli()`;
+pass through `TestRunner.__init__` rather than reaching into its internals from `cli.py`.
 
-## 15. CLI Architecture
+## 12. Adding a New Automation Tool
 
-`framework/cli.py`:
+No code change needed — `RUN "<any command>"` already runs through the one generic
+`CommandExecutor`. Only touch code if the new tool's output needs a **new validator** (§5). Do
+not add a per-tool executor subclass.
 
-- **Argument parsing:** `build_arg_parser()` returns a plain `argparse.ArgumentParser` with
-  one positional (`path`) and three optional flags (`--config`, `--log-level`, `--dry-run`).
-  `main(argv)` calls `parser.parse_args(argv)` — `argparse` itself handles `-h`/`--help` and
-  rejects extra positional arguments (`unrecognized arguments`) with its own exit code `2`
-  before any of this framework's code runs.
-- **Defaults:** `--config` defaults to `None` (→ `ConfigManager()` built-in defaults);
-  `--log-level` defaults to `None` (→ no override, config's `log_level` stands);
-  `--dry-run` defaults to `False`.
-- **Validation:** `--log-level` is constrained via `choices=[...]` at the `argparse` level —
-  an invalid value is rejected by `argparse` itself, not by framework code.
-- **Error handling:** `ConfigManager` construction failures (bad `--config` path, missing
-  PyYAML) are caught in `main()` and reported (the one `print()` exception, see Section 10)
-  with exit code `2`. `discover_targets()` raising `FileNotFoundError` (bad `path`) is caught
-  in `_run_cli()` and logged via `test_runner.log.error()`, also exit code `2`.
-- **Exit codes:** `0` (all discovered targets `PASS`, or `--dry-run`, or zero targets found),
-  `1` (at least one target `FAIL`/`ERROR`), `2` (usage/path/config error).
+## 13. Testing & Debugging
 
-**Adding a new CLI option correctly:**
-1. Add it to `build_arg_parser()`.
-2. Read `args.<name>` in `main()`/`_run_cli()` and act on it — if it affects `TestRunner`
-   construction (like a hypothetical `--variables` override), pass it through
-   `TestRunner.__init__`'s existing parameters rather than reaching into `TestRunner`
-   internals from `cli.py`.
-3. If it changes reported behavior (like `--dry-run` did), make sure `print_summary()` still
-   produces a sensible table for the new mode.
+No pytest anywhere. `run.py` holds ~50 hand-written `assert`-based check functions, run via
+`python3 run.py` (no args). Mocks: `printf`/`python3 -c` standing in for `nvme` output; real
+`lsblk` and file-based `fio` are actually executed (safe); every `tests/examples/` file
+requiring real hardware/destructive behavior is only **parsed**, never executed
+(`_HARDWARE_OR_DESTRUCTIVE_EXAMPLES` set in `run.py`).
 
----
-
-## 16. Adding a New `.nvtest` Feature
-
-Worked example, using the hypothetical `EXPECT_REGEX` mentioned in the task brief as a
-**worked, not-yet-implemented** illustration (this feature does **not** exist in the current
-codebase — do not document it as real elsewhere):
-
-1. **Parser** (`parser.py`): add a new kind constant (e.g. `TEXT_REGEX = "TEXT_REGEX"`), add
-   an `elif keyword == "EXPECT_REGEX":` branch mirroring the existing `EXPECT_BYTE`/
-   `EXPECT_HEX` branches — validate token count, validate/compile the pattern at parse time
-   (so a malformed regex is a `ParseError`, not a runtime surprise), and append a
-   `Validation(kind=TEXT_REGEX, run_index=current_run_index, line_no=i, field=...)`.
-2. **`TestCase` representation:** no change needed — `Validation` already has enough generic
-   optional fields (`field`, `value`) to hold a regex pattern string; only add a new field if
-   the semantics genuinely don't fit the existing ones.
-3. **Validator** (`validator.py`): add an `elif v.kind == TEXT_REGEX:` branch in `validate()`
-   that runs `re.search(pattern, result.stdout_text())` and builds a `(passed, message)` pair
-   consistent with the existing branches' style (state what was expected, append "(got ...)"
-   on failure).
-4. **Tests:** add a small `.nvtest` file exercising both a matching and non-matching case, and
-   add a corresponding check to `run.py`'s self-verification harness (see Section 19) — do not
-   introduce pytest.
-5. **Documentation:** update the Validation Reference table in `USER_GUIDE.md` and this
-   guide's Section 9.
-
-This same five-step shape (Parser → TestCase → Validator → Tests → Documentation) applies to
-any new `.nvtest` statement, not just validators.
-
----
-
-## 17. Adding a New Validator
-
-1. **Define syntax** — decide the keyword/operator and its argument shape, consistent with
-   the existing style (`EXPECT_<NOUN>` for a new top-level statement, or a new operator word
-   after `EXPECT "<field>"` for a text-style check).
-2. **Update the parser** (`parser.py`) — add the keyword/operator branch, argument-count
-   validation, and construct the appropriate `Validation`.
-3. **Implement the validator** — add the corresponding branch inside
-   `validator.py: validate()`.
-4. **Connect it** — nothing else needs wiring; `Validator.validate()` and
-   `TestRunner.run()` already iterate `test_case.validations` generically regardless of kind.
-5. **Create a minimal test** — a `.nvtest` file under `tests/` exercising both pass and fail
-   cases for the new validator, safe/mocked if it doesn't need real hardware.
-6. **Verify logging** — run it and confirm the `.log`'s `VALIDATION:` section shows a
-   sensible `[PASS]`/`[FAIL]` line (the message format is entirely up to your new branch —
-   follow the existing `f"<description> == <expected>"` / `" (got <actual>)"` on-failure
-   pattern for consistency).
-7. **Update documentation** — the Validation Reference table in both guides.
-
----
-
-## 18. Adding a New Command/Automation Tool
-
-No code changes are needed to support a new tool (a new NVMe subcommand, a different storage
-benchmarking tool, etc.) — `RUN "<any command>"` already executes anything through
-`CommandExecutor`, which has no tool-specific branching at all:
-
-```
-NVMe commands  --\
-FIO commands    --+--> RUN "<command string>" --> CommandExecutor.run() --> CommandResult
-Linux commands  --/
-Future tool     --/
-```
-
-The only reason to touch code for "supporting" a new tool is if you need a **new kind of
-validation** specific to that tool's output shape (e.g. a JSON-output validator for a tool
-that emits JSON) — that follows Section 17, not this section. Do not create a
-`FioExecutor`/`NvmeExecutor` subclass or similar — the single generic `CommandExecutor` is a
-deliberate design invariant from the framework's earliest phase, re-confirmed still true by
-inspection of every current caller.
-
----
-
-## 19. Testing Strategy
-
-The framework does not use pytest anywhere — confirmed by inspection, no `pytest` import
-exists in the codebase. Instead, `run.py` contains a large number of hand-written functions
-(no test framework, just plain functions with `assert` statements and `print("[PASS] ...")`
-on success), invoked in sequence from `main()` when `run.py` is executed with no CLI
-arguments.
-
-**What is mocked:** commands standing in for real NVMe output use `printf` (e.g.
-`tests/TC001_success.nvtest` mocks `nvme id-ctrl`'s "Model Number"/"Firmware Revision" fields)
-or a small inline `python3 -c '...'` script (for binary-output tests, e.g.
-`tests/TC003_byte_validation.nvtest` writes literal bytes via
-`sys.stdout.buffer.write(bytes([...]))`).
-
-**What requires real NVMe hardware:** every file under `tests/examples/` whose name contains
-`HARDWARE_REQUIRED` or targets a real device path, plus any file listed in `run.py`'s
-`_HARDWARE_OR_DESTRUCTIVE_EXAMPLES` set — these are parsed (to confirm valid `.nvtest` syntax)
-but never executed by the self-verification harness.
-
-**Safe commands actually executed by the harness:** real `lsblk` (read-only, always safe) and
-real `fio` targeting a file under `/tmp` (never a raw device) — these genuinely run as part of
-`python3 run.py` with no arguments, proving real command integration, not just mocks.
-
-**Binary-output testing:** `tests/TC003_byte_validation.nvtest` /
-`tests/TC004_hex_validation.nvtest` exercise `EXPECT_BYTE`/`EXPECT_HEX` against mock binary
-stdout; `examples_parse_cleanly()` (in `run.py`) confirms every file under `tests/examples/`
-(including the real-hardware passthru examples) at least **parses** as valid `.nvtest` syntax.
-
-**Parser testing:** covered both via the shipped `.nvtest` files (`TC005_invalid_syntax.nvtest`
-exercises a parse failure) and via direct `parse_text()` calls with hand-constructed invalid
-strings during earlier development (missing `END`, `EXPECT` before `RUN`, unknown keyword,
-bad operator) — these ad hoc checks are not currently part of the permanent `run.py` suite,
-but the shipped invalid-syntax `.nvtest` file is.
-
-**Validator testing:** covered by `tests/TC001_success.nvtest` /
-`TC002_failed_validation.nvtest` (text validations, including the "all validations still run
-after one fails" property, explicitly asserted) and the byte/hex tests above.
-
-**Integration testing:** `run.py`'s `cli_directory()` function runs an entire directory
-(`tests/`) through the real CLI path in one call, asserting PASS/FAIL/ERROR status for
-specific known files and confirming every test in that one invocation shares the same run
-directory — this is the closest thing to an end-to-end integration test in the codebase.
-
-**LOOP/PARALLEL/EXPECT_STDERR testing:** `loop_execution_aggregates_correctly()` and
-`loop_execution_reports_first_failure()` (`run.py`) cover a plain `LOOP` and an intermittently
-failing `LOOP` (the latter uses an external counter file rather than a `{{variable}}`, since
-variables substitute once per `RUN`, not once per iteration, so a variable can't itself make a
-command fail on a specific iteration). `parallel_block_runs_concurrently()` proves actual
-wall-clock overlap using `sleep`-based commands with a generous timing margin (parallel must be
-under 75% of the equivalent sequential duration — loose enough to avoid CI flakiness while
-still catching a regression to fully-sequential execution).
-`parallel_example_validates_each_loop_independently()` and
-`parallel_parser_rejects_invalid_blocks()` cover the shipped `PARALLEL` example and the
-parser's structural rules (min-2-`RUN`, no nesting, unclosed block). `expect_stderr_
-validates_and_excludes_stdout()` covers `EXPECT_STDERR` matching plus confirming a plain
-`EXPECT` on the same `RUN` still only sees stdout.
-
-**CAPTURE/EXPECT_REGEX testing:** `capture_variable_available_to_later_run()` covers the basic
-capture-then-reference-later flow (TC013). `capture_works_without_variables_file()` covers
-construction with a nonexistent variables path, proving `CAPTURE` doesn't depend on
-`common_variables.json` existing at all. `capture_forward_reference_to_undefined_variable_
-errors_clearly()` builds a temp `.nvtest` referencing a `{{name}}` never `CAPTURE`d anywhere,
-asserting `VariableError` and that no `.log` file is produced. `parallel_capture_is_thread_
-safe()` runs two concurrent `RUN`s inside a `PARALLEL` block, each `CAPTURE`ing into a
-*different* variable, and confirms both values are correctly available afterward (a
-regression test for the `VariableManager` locking added alongside this feature).
-`expect_regex_matches_stdout_and_stderr()` covers TC014 (`EXPECT_REGEX`/
-`EXPECT_REGEX_STDERR`); `expect_regex_rejects_invalid_pattern_at_parse_time()` confirms a
-malformed pattern is a `ParseError`, not a crash.
-
-**Manually verifying a change:**
 ```bash
-python3 -m pyflakes framework/*.py run.py   # lint (no unused imports/dead code)
-python3 run.py                              # full internal self-verification suite
-python3 run.py tests/TC001_success.nvtest   # spot-check a real CLI invocation
-python3 run.py tests/TC011_parallel_stress.nvtest  # spot-check LOOP/PARALLEL
-python3 run.py tests/TC013_capture_variable.nvtest # spot-check CAPTURE
+python3 -m pyflakes framework/*.py run.py   # lint
+python3 run.py                              # full self-verification
+python3 run.py tests/TC001_success.nvtest --log-level DEBUG   # verbose spot-check
 find . -name "*.bin"                        # must always be empty
 ```
+Debugging: parser errors carry line+text; command failures are visible in the `.log`'s
+`EXIT CODE:`/`STDERR:`; validation failures append `(got ...)`/`(field not found...)`; binary
+mismatches compare against `BINARY OUTPUT: Size:` in the log, not assumptions.
 
----
+## 14. Extension Guidelines
 
-## 20. Debugging Guide
+`.nvtest` stays the only test format. Python stays framework-only. Config stays in YAML via
+`ConfigManager`; shared values stay in JSON via `VariableManager`. Route all status output
+through `FrameworkLogger`, never `print()`. Keep `utility.py` the single reusable-helper
+module. Validate against raw bytes, never the rendered hex dump. No new dependency beyond
+PyYAML without a real need.
 
-| Problem area | Where to look | What to check |
-|---|---|---|
-| Parser errors | `framework/parser.py`, the `ParseError` message itself | The message always includes the exact line number and offending line text — start there before reading code |
-| Command failures | The relevant `.log` file's `EXIT CODE:`/`OUTPUT:`/`STDERR:` blocks | `CommandExecutor.run()` never raises for a failed command — check the captured exit code/stderr in the log, not a stack trace |
-| Validation failures | The `.log` file's `VALIDATION:` section | Each `[FAIL]` line includes a `(got ...)`/`(field not found in output)` suffix explaining exactly why |
-| Variable problems | `framework/variable_manager.py`, the `VariableError` message | Names the exact missing `{{name}}` and which file was searched |
-| YAML problems | `framework/config_manager.py` | `ConfigManager.__init__` raises `FileNotFoundError`/`RuntimeError` immediately at construction — check `cli.main()`'s try/except around it |
-| Binary validation | `framework/validator.py`'s `BYTE`/`HEX` branches, and the `.log`'s `BINARY OUTPUT:` hex dump | Validation runs against raw bytes (`result.stdout`), the hex dump is only a rendering — if they seem to disagree, re-check the offset/byte-order in your `.nvtest`, not the dump |
-| Logger issues | `framework/framework_log.py` | Each `FrameworkLogger` has a unique internal logger name (`uuid`-suffixed) — if you're debugging by inspecting `logging.getLogger()` state directly, remember the name isn't `"nvme_test"` verbatim |
-| CLI issues | `framework/cli.py: main()`/`_run_cli()` | Check exit code first (`0`/`1`/`2` mean different failure classes), then the `ERROR` rows' `->` detail lines in the printed table |
+## 15. Actual Limitations
 
----
-
-## 21. Error Handling
-
-| Error category | Raised as | Surfaces to the user as | Effect on result |
-|---|---|---|---|
-| Configuration Error | `FileNotFoundError` / `RuntimeError` from `ConfigManager.__init__` | `Error: <message>` via `print()`, before any test runs | Process exits `2`; no tests run at all |
-| Parser Error | `parser.ParseError` | `ERROR` row in the CLI table, with the line-numbered message as detail | That one test is `ERROR`; no `.log` written for it; other targets in the batch still run |
-| Variable Error | `variable_manager.VariableError` | `ERROR` row, "Unknown variable {{name}} (not found in ...)" | Same as Parser Error |
-| Unsupported file type | `runner.UnsupportedFileTypeError` | `ERROR` row, "Unsupported test file type '...' ..." | Same as Parser Error |
-| Any other unexpected exception during `test_runner.run()` | caught generically in `cli.run_targets()`'s final `except Exception` | `ERROR` row, "Unexpected error: <str(exc)>"; also logged via `FrameworkLogger.error()` | Same as Parser Error — critically, **does not abort the rest of the batch** |
-| Command Error (nonzero exit, timeout, missing binary) | not an exception at all — `CommandExecutor.run()` always returns a `CommandResult` | Reflected only through whatever `EXPECT_EXIT`/`EXPECT`/etc. checks are bound to that command | That test is `FAIL` only if a bound validation actually fails because of it |
-| Validation Failure | not an exception — a `ValidationResult(passed=False, ...)` | `[FAIL] ...` line in the `.log`, test status `FAIL` | Test is `FAIL`; every other validation in the file still runs |
-| Framework/CLI usage error | `argparse` itself (bad flag, extra positional, missing `path`) | `argparse`'s own usage message to stderr | Process exits `2`, before any framework code runs |
-
-**Key distinction:** everything in the top half of this table (Configuration/Parser/Variable/
-Unsupported-file/Unexpected) means the test **never executed at all** and produces **no
-`.log` file** — reported as `ERROR`. Everything in the bottom half (Command/Validation)
-means the test **did execute** and its outcome is recorded normally as `PASS`/`FAIL` with a
-full `.log`.
-
----
-
-## 22. Extension Guidelines
-
-- `.nvtest` remains the only test-case format — never add a code path that executes `.py`,
-  `.yaml`, `.json`, or `.xml` as a test definition.
-- Python is for framework implementation only — test authors should never need to write
-  Python.
-- Use classes only where they hold real state or a real dependency graph (see the "why each
-  class exists" reasoning in Section 4) — do not add a class for a single free function with
-  no state.
-- Route all framework status/diagnostic/result output through `FrameworkLogger` — never add a
-  bare `print()` outside the one documented bootstrap exception in `cli.main()`.
-- Keep all configurable values in `ConfigManager`/`config.yaml` — never hardcode a new
-  timeout, path, or level directly in framework code.
-- Keep shared test values in `common_variables.json`/`VariableManager` — never hardcode a
-  device path or expected value directly in framework code.
-- Put genuinely reusable, non-test-specific helpers in `utility.py` — nowhere else, and don't
-  create a second utility module.
-- Preserve raw binary output through to validation — never validate against the formatted hex
-  dump text.
-- Avoid new dependencies beyond PyYAML unless a documented requirement genuinely needs one.
-- Avoid duplicating logic that already exists in `utility.py`/`parser.py`'s hex-or-decimal
-  parsing, timestamp formatting, or filename sanitization.
-- Keep the framework lightweight — no database, no web UI/API, no plugin system, no pytest.
-
----
-
-## 23. Developer Best Practices
-
-- **Naming:** classes are `PascalCase` nouns describing their one responsibility
-  (`CommandExecutor`, `ValidationResult`); functions/methods are `snake_case` verbs
-  (`parse_file`, `write_nvtest_log`); module-level "private" helpers are prefixed `_`
-  (`_render_command_block`, `_find_field_line`).
-- **Error handling:** raise a specific exception type at the point of failure (`ParseError`,
-  `VariableError`, `UnsupportedFileTypeError`) rather than a bare `Exception`/`ValueError`, so
-  callers can catch precisely — see Section 21's table for the existing taxonomy.
-- **Type hints:** used on public function/method signatures throughout (e.g.
-  `def run(self, path: str) -> NvtestResult:`), but not exhaustively on every local variable —
-  follow the existing density rather than adding hints everywhere.
-- **Python 3.8 compatibility:** no walrus operator, no `X | Y` union-type syntax, no built-in
-  generic subscripting (`list[str]` used only in comments/docstrings, never as a runtime
-  annotation — `typing.List`/`typing.Optional` are used instead). Confirmed via direct
-  inspection across every module.
-- **Backward compatibility:** when renaming a public class, keep an alias (see `Executor =
-  CommandExecutor`, `Logger = ResultLogger`) rather than breaking existing imports, unless the
-  rename is accompanied by a deliberate, documented breaking-change decision.
-- **Small methods:** most methods in this codebase are under ~30 lines; `TestRunner.run()` and
-  `parser.parse_text()` are the largest (each doing one clearly-named multi-step job) — if a
-  new addition grows a method much larger than these, consider extracting a helper.
-- **Clear interfaces:** prefer passing already-constructed dependencies into `__init__`
-  (`Validator(variable_manager=...)`, `ResultLogger(log_dir=...)`) over having a class reach
-  out to global state to find its own dependencies.
-- **Avoiding global state:** there is no module-level mutable state anywhere in `framework/`
-  except the intentionally-shared stdlib `logging` registry (which `FrameworkLogger`
-  deliberately works around with per-instance unique names, per Section 10/24) — keep it that
-  way.
-- **Avoiding unnecessary abstractions:** `CliTarget` is a two-field plain class rather than a
-  dataclass or a namedtuple purely because that's what already existed when it was introduced
-  — either would be fine; don't feel obligated to convert it without a real reason.
-
----
-
-## 24. Known Limitations / Technical Debt
-
-Confirmed by direct inspection of the current implementation — nothing here is invented:
-
-- **`validate()` free function + `Validator` class near-duplication** (`validator.py`): the
-  module-level `validate()` function has exactly one caller today
-  (`Validator.validate()`). This is acknowledged technical debt from an earlier hardening
-  pass, deliberately left as-is rather than inlined, since it carries no functional risk.
-- **`config/config.yaml` is not auto-loaded by default** — a deliberate decision (documented
-  in the file's own header comment and in `USER_GUIDE.md` Section 8), not an oversight: adding
-  auto-discovery was considered and rejected because it would introduce new, implicit,
-  environment-dependent path-resolution behavior (relative to script location vs. current
-  working directory) with no documented requirement demanding it.
-- **No numeric-comparison validator** — `common_variables.json`'s shipped `min_iops` field has
-  no consumer anywhere in the DSL; adding one (e.g. `EXPECT_MIN_IOPS`) is a scope decision, not
-  yet made.
-- **`{{variable}}` substitution does not cover `EXPECT_EXIT`/`EXPECT_BYTE`/`EXPECT_HEX`** —
-  only `RUN` commands and `EXPECT ... CONTAINS` values are substituted; `EXPECT_EXIT`'s
-  argument is converted to an integer at parse time, before any substitution step could apply.
-- **Variable values are not shell-escaped** before being substituted into `RUN` strings
-  (`shell=True`) — documented as an explicit trust-boundary assumption in
-  `variable_manager.py`'s module docstring rather than fixed, since automatic escaping
-  (`shlex.quote()`) would break the common, legitimate case of a variable expanding to an
-  unquoted path.
-- **`CommandExecutor`'s `except FileNotFoundError` branch is effectively unreachable** under
-  the `shell=True` mode every current caller uses (a missing binary surfaces as a nonzero
-  shell exit code, not a Python-level `FileNotFoundError`) — left in place as defensive code
-  for a hypothetical future `shell=False` caller, not removed, since it's harmless.
-- **No parallel/concurrent test execution across files** — every *target file* in a directory
-  batch still runs strictly sequentially through one `TestRunner` (`cli.run_targets()`); only
-  concurrency *within* a single `.nvtest` file's `PARALLEL` block exists. Nothing in the
-  current architecture prevents adding cross-file concurrency later, but it does not exist
-  today.
-- **`PARALLEL` uses one OS thread per `RUN` in the block, not a bounded worker pool** —
-  `ThreadPoolExecutor(max_workers=len(group_indices))` sizes the pool exactly to the group, so
-  a `PARALLEL` block with many `RUN` statements spawns that many threads at once. Fine for the
-  framework's realistic use case (a handful of concurrent command streams), but not designed
-  for dozens+ of concurrent members.
-- **`describe_validation()` duplicates `check_validation()`'s base-description strings** — a
-  small, deliberate duplication (see Section 9) rather than adding a "label-only" mode to
-  `check_validation()`'s signature; if the two ever drift out of sync (e.g. someone updates one
-  branch's wording but not the other's), a `LOOP`ed validation's aggregate message and a
-  `LOOP 1` validation's message for the same kind could read slightly differently. Low risk,
-  since both are short, colocated in the same file, and covered by the LOOP/PARALLEL
-  regression tests.
-- **`run.py`'s no-argument mode doubles as both "help text" and "run the whole internal test
-  suite"** — there is no separate, lightweight "show usage" path for zero arguments; this is
-  long-standing, intentional behavior (documented in `run.py`'s own module docstring) rather
-  than an oversight, but is worth knowing before scripting around `run.py` with no arguments.
-- **`CAPTURE` only stores stdout, always as a stripped string** — there is no `CAPTURE_STDERR`,
-  and `VariableManager.set()` is called with `last_result.stdout_text().strip()` specifically,
-  not the raw bytes. Adding stderr capture would follow the same shape (a `CAPTURE_STDERR
-  <name>` modifier, or a stream-selecting variant of the existing one) but doesn't exist today.
-- **Substitution is no longer fully upfront** (see Section 7a's "JIT substitution" note) —
-  this is a deliberate, necessary tradeoff for `CAPTURE` to work at all, but it does mean a
-  `.nvtest` file with a typo'd `{{name}}` in its *last* `RUN` will still execute every earlier
-  `RUN` (with real side effects) before the typo is caught. No static dependency-order checker
-  was built to catch this before execution begins, to avoid a second, parallel notion of
-  "will this resolve" that could drift from actual runtime substitution behavior.
-- **No protection against two `PARALLEL`-block `RUN`s `CAPTURE`ing into the same name** — the
-  underlying dict write is safe (see Section 12's locking), but which value ends up stored is
-  a last-write-wins race, undetected and unwarned-about by the parser. Documented as a "don't
-  do this" in USER_GUIDE.md rather than statically prevented.
-- **`EXPECT_REGEX`/`EXPECT_REGEX_STDERR` use `re.search()`, not `re.fullmatch()`** — matching
-  anywhere in the output is sufficient to pass; there's no dedicated "must match the entire
-  output" mode short of the test author writing `^...$` themselves.
+- No numeric-comparison validator (`min_iops` in the example JSON is unconsumed).
+- `EXPECT_EXIT`/`EXPECT_BYTE`/`EXPECT_HEX` don't support `{{variable}}` substitution.
+- `EXPECT_REGEX` uses `search()`, not `fullmatch()`.
+- Variable values are not shell-escaped before substitution into `RUN` (`shell=True`) —
+  `common_variables.json` must be trusted input, same as `.nvtest` files.
+- Substitution is JIT per-`RUN`, not all upfront — a bad `{{name}}` in a later `RUN` is only
+  caught once execution reaches it; earlier `RUN`s' side effects will already have happened.
+- Two `PARALLEL`-block `RUN`s `CAPTURE`ing the same name race (last write wins); not
+  statically prevented.
+- Concurrency is only intra-file (`PARALLEL`); directory-batch targets still run sequentially.
+- `PARALLEL` spawns one OS thread per member with no pool cap.
+- `describe_validation()` duplicates `check_validation()`'s description strings (accepted, low-risk debt).
+- `run.py` with no args runs the full internal test suite, not a help/usage message.
