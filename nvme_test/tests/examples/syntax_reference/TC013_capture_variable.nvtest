@@ -1,0 +1,17 @@
+# Demonstrates RUN ... CAPTURE <name>: the first RUN's stdout is stored as
+# a runtime variable, then referenced via {{fw_version}} in a LATER RUN
+# and in an EXPECT CONTAINS value -- exactly like a common_variables.json
+# variable, except captured live from a command's own output. Safe/mock:
+# no hardware needed.
+TEST "Capture Output Into Variable"
+
+RUN "echo FW1234ABCD" CAPTURE fw_version
+
+EXPECT_EXIT 0
+
+RUN "echo Using captured firmware {{fw_version}}"
+
+EXPECT_EXIT 0
+EXPECT "Using captured firmware" CONTAINS "{{fw_version}}"
+
+END

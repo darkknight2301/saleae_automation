@@ -181,6 +181,7 @@ _HARDWARE_OR_DESTRUCTIVE_EXAMPLES = {
     "TC012_combined_passthru_validation.nvtest",   # needs real hardware
     "TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest",  # needs real hardware
     "TC014_invalid_field_stderr.nvtest",                       # needs nvme-cli installed
+    "TC015_capture_regex_HARDWARE_REQUIRED.nvtest",            # needs real hardware
 }
 
 # Examples that are genuinely safe to execute (no hardware, no destructive
@@ -309,7 +310,7 @@ def variable_manager_loads_and_substitutes():
 
     vm = VariableManager("common_variables.json")
     assert vm.get("device") == "/dev/nvme0"
-    assert vm.substitute("nvme id-ctrl {{device0}}") == "nvme id-ctrl /dev/nvme0"
+    assert vm.substitute("nvme id-ctrl {{device}}") == "nvme id-ctrl /dev/nvme0"
     try:
         vm.get("does_not_exist")
         raise AssertionError("expected VariableError for missing variable")
@@ -319,7 +320,7 @@ def variable_manager_loads_and_substitutes():
 
 
 def variable_substitution_end_to_end():
-    """A .nvtest using {{device0}} resolves and runs through TestRunner."""
+    """A .nvtest using {{device}} resolves and runs through TestRunner."""
 
     test_runner = TestRunner(config=ConfigManager())
     result = test_runner.run("tests/TC007_variable_substitution.nvtest")
@@ -639,6 +640,124 @@ def expect_stderr_validates_and_excludes_stdout():
         test_runner.close()
 
 
+def capture_variable_available_to_later_run():
+    """TC013: RUN ... CAPTURE stores stdout as a runtime variable, usable
+    by a LATER RUN and EXPECT ... CONTAINS via {{name}}."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC013_capture_variable.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        messages = [m for _, m in result.validation_lines]
+        assert any("FW1234ABCD" in m for m in messages), messages
+        print(f"[PASS] capture_variable_available_to_later_run -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
+def capture_works_without_variables_file():
+    """CAPTURE must work even when no variables file is loaded at all."""
+    test_runner = TestRunner(config=ConfigManager(), variables_path="/tmp/does_not_exist_ever.json")
+    try:
+        result = test_runner.run("tests/TC013_capture_variable.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        print("[PASS] capture_works_without_variables_file")
+    finally:
+        test_runner.close()
+
+
+def capture_forward_reference_to_undefined_variable_errors_clearly():
+    """A RUN referencing a {{name}} never CAPTUREd anywhere earlier must
+    raise VariableError -- reported as ERROR, no .log written -- exactly
+    like referencing an undefined common_variables.json name."""
+    import tempfile
+    from framework.variable_manager import VariableError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bad.nvtest")
+        with open(path, "w") as f:
+            f.write(
+                'TEST "Undefined Variable Reference"\n'
+                'RUN "echo first-command-ran"\n'
+                "EXPECT_EXIT 0\n"
+                'RUN "echo {{never_captured}}"\n'
+                "EXPECT_EXIT 0\n"
+                "END\n"
+            )
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            try:
+                test_runner.run(path)
+                raise AssertionError("expected VariableError")
+            except VariableError:
+                produced_logs = [f for f in os.listdir(test_runner.run_dir) if f.endswith(".log") and f != "run.log"]
+                assert not produced_logs, f"expected no .log file, found: {produced_logs}"
+                print("[PASS] capture_forward_reference_to_undefined_variable_errors_clearly")
+        finally:
+            test_runner.close()
+
+
+def parallel_capture_is_thread_safe():
+    """Two concurrent RUNs inside a PARALLEL block, each capturing into a
+    DIFFERENT variable, must not corrupt each other -- both values must
+    be correctly available afterward."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "parallel_capture.nvtest")
+        with open(path, "w") as f:
+            f.write(
+                'TEST "Parallel Capture Thread Safety"\n'
+                "PARALLEL\n"
+                'RUN "echo alpha-value" CAPTURE var_a LOOP 50\n'
+                "EXPECT_EXIT 0\n"
+                'RUN "echo beta-value" CAPTURE var_b LOOP 50\n'
+                "EXPECT_EXIT 0\n"
+                "END_PARALLEL\n"
+                'RUN "echo Got {{var_a}} and {{var_b}}"\n'
+                "EXPECT_EXIT 0\n"
+                'EXPECT "Got" CONTAINS "{{var_a}}"\n'
+                'EXPECT "Got" CONTAINS "{{var_b}}"\n'
+                "END\n"
+            )
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            result = test_runner.run(path)
+            assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+            messages = [m for _, m in result.validation_lines]
+            assert any("alpha-value" in m for m in messages), messages
+            assert any("beta-value" in m for m in messages), messages
+            print(f"[PASS] parallel_capture_is_thread_safe -> {result.log_path}")
+        finally:
+            test_runner.close()
+
+
+def expect_regex_matches_stdout_and_stderr():
+    """TC014: EXPECT_REGEX/EXPECT_REGEX_STDERR match a Python re pattern
+    against stdout/stderr respectively."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC014_regex_validation.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        messages = [m for _, m in result.validation_lines]
+        assert any("matches regex" in m and "(stderr)" in m for m in messages), messages
+        assert any("matches regex" in m and "(stderr)" not in m for m in messages), messages
+        print(f"[PASS] expect_regex_matches_stdout_and_stderr -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
+def expect_regex_rejects_invalid_pattern_at_parse_time():
+    """A malformed regex must be a ParseError, not a runtime crash."""
+    from framework.parser import parse_text, ParseError
+
+    try:
+        parse_text('TEST "x"\nRUN "echo hi"\nEXPECT_REGEX "[invalid"\nEND\n')
+        raise AssertionError("expected ParseError for malformed regex")
+    except ParseError:
+        pass
+    print("[PASS] expect_regex_rejects_invalid_pattern_at_parse_time")
+
+
 def main():
     print("Running Phase 1 smoke verification...\n")
     smoke_success()
@@ -691,6 +810,15 @@ def main():
     parallel_parser_rejects_invalid_blocks()
     expect_stderr_validates_and_excludes_stdout()
     print("\nAll LOOP/PARALLEL/EXPECT_STDERR checks passed.")
+
+    print("\nRunning CAPTURE/EXPECT_REGEX verification...\n")
+    capture_variable_available_to_later_run()
+    capture_works_without_variables_file()
+    capture_forward_reference_to_undefined_variable_errors_clearly()
+    parallel_capture_is_thread_safe()
+    expect_regex_matches_stdout_and_stderr()
+    expect_regex_rejects_invalid_pattern_at_parse_time()
+    print("\nAll CAPTURE/EXPECT_REGEX checks passed.")
 
 
 if __name__ == "__main__":

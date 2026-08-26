@@ -1,6 +1,6 @@
-# NVMe Test Automation Framework — Developer Guide
+# NVMe/FIO Test Automation Framework — Developer Guide
 
-This guide is for maintaining, debugging, or extending the framework. All class
+This guide is for engineers maintaining, debugging, or extending the framework. All class
 names, method names, file paths, and behavior described here were verified directly against
 the source in `framework/` and `run.py`, and by actually executing the code shown.
 
@@ -82,6 +82,14 @@ run.py
 | `Utility` (module, not a class) | `hex_dump`, `safe_filename`, `format_timestamp`, `new_run_id`, `parse_int_maybe_hex` |
 | `CliTarget` | One resolved file path + its CLI display label |
 
+**Design decisions worth knowing:**
+- `Executor` and `Logger` still exist as **backward-compatible aliases** (`Executor =
+  CommandExecutor` in `executor.py`; `Logger = ResultLogger` in `logger.py`) from earlier
+  naming. New code should use `CommandExecutor`/`ResultLogger` directly.
+- There is a module-level `validate()` function in `validator.py` in addition to the
+  `Validator` class; `Validator.validate()` is a thin wrapper delegating to it. This is
+  acknowledged, low-priority duplication (documented technical debt, not a bug) rather than an
+  oversight — see Section 24.
 
 ---
 
@@ -90,12 +98,12 @@ run.py
 ```
 nvme_test/
 ├── run.py                       # CLI entry point + internal self-verification harness
-├── requirements.txt              # Python dependencies
-├── common_variables.json         # Default variables file
+├── requirements.txt              # PyYAML>=6.0
+├── common_variables.json         # shipped default variables file
 ├── config/
-│   └── config.yaml                # Config template
+│   └── config.yaml                # shipped config template (NOT auto-loaded, see cli.py)
 ├── framework/
-│   ├── __init__.py                # Init.
+│   ├── __init__.py                # empty
 │   ├── parser.py                   # ParseError, Validation, TestCase, TestParser, parse_text/parse_file
 │   ├── validator.py                 # ValidationResult, validate(), Validator
 │   ├── executor.py                  # CommandResult, CommandExecutor (alias: Executor)
@@ -245,7 +253,8 @@ parse_text()/parse_file()  -- line-by-line, single pass, no lookahead
       |
       v
 TestCase(name, commands: List[str], validations: List[Validation], source_path,
-          loop_counts: List[int], parallel_group_id: List[Optional[int]])
+          loop_counts: List[int], parallel_group_id: List[Optional[int]],
+          capture_names: List[Optional[str]])
 ```
 
 **Parsing flow (`framework/parser.py: parse_text()`):**
@@ -256,16 +265,22 @@ TestCase(name, commands: List[str], validations: List[Validation], source_path,
 - Each line is tokenized with `shlex.split(line, posix=True)` — this is what makes
   `"quoted values with spaces"` and embedded single quotes work correctly.
 - The first token dispatches to one of: `TEST`, `RUN`, `PARALLEL`, `END_PARALLEL`,
-  `EXPECT_EXIT`, `EXPECT`, `EXPECT_STDERR`, `EXPECT_BYTE`, `EXPECT_HEX`, `END`. Anything else
-  raises `ParseError(f"unknown statement {keyword!r}", ...)`.
+  `EXPECT_EXIT`, `EXPECT`, `EXPECT_STDERR`, `EXPECT_BYTE`, `EXPECT_HEX`, `EXPECT_REGEX`,
+  `EXPECT_REGEX_STDERR`, `END`. Anything else raises `ParseError(f"unknown statement
+  {keyword!r}", ...)`.
 
 **Structural validation performed inline, not as a second pass:**
 - `TEST` must be the very first statement (`statements_seen != 1` check) and must appear
   exactly once.
 - `RUN` must come after `TEST`.
-- `RUN "<command>" [LOOP <n>]` — `len(tokens)` must be `2` (no LOOP) or `4` (`RUN`, command,
-  the literal token `"LOOP"`, and the count); `loop_counts.append(loop_count)` records `1` for
-  every plain `RUN`, keeping `loop_counts` the same length/order as `commands` at all times.
+- `RUN "<command>" [LOOP <n>] [CAPTURE <name>]` — after the mandatory `RUN`/command tokens,
+  any remaining tokens must come in `(modifier, value)` pairs (`(len(tokens) - 2) % 2 == 0`).
+  Each pair's modifier must be `LOOP` or `CAPTURE`, each may appear at most once, and they can
+  appear in either order. `LOOP`'s value is parsed via `_parse_int_maybe_hex()` (must be `>=
+  1`); `CAPTURE`'s value must match `_CAPTURE_NAME_RE` (`[A-Za-z0-9_]+`) — the same charset
+  `{{name}}` placeholders use. `loop_counts.append(1)` / `capture_names.append(None)` when the
+  corresponding modifier is absent, keeping both lists the same length/order as `commands` at
+  all times.
 - `PARALLEL` opens a block: `in_parallel` must be `False` (no nesting), and a fresh
   `current_parallel_group` id (`next_parallel_group`, a simple incrementing counter) is
   assigned. Every `RUN` parsed while `in_parallel` is `True` gets that id appended to
@@ -279,12 +294,12 @@ TestCase(name, commands: List[str], validations: List[Validation], source_path,
 - `END` (the file's real ending statement) raises `ParseError("missing END_PARALLEL before
   END", ...)` if `in_parallel` is still `True` — an unclosed `PARALLEL` block is caught the
   moment `END` is reached, not only at end-of-file.
-- Every `EXPECT*`/`EXPECT_STDERR` keyword requires `current_run_index != -1` (i.e., at least
-  one `RUN` must have already been seen) — this is how "validation binds to the nearest
-  preceding RUN" is implemented, and it works identically whether that `RUN` is inside a
-  `PARALLEL` block or not: `current_run_index` is simply updated to `len(commands) - 1` every
-  time a `RUN` line is processed, and every subsequent `Validation` object is stamped with
-  whatever `current_run_index` currently holds.
+- Every `EXPECT*`/`EXPECT_STDERR`/`EXPECT_REGEX*` keyword requires `current_run_index != -1`
+  (i.e., at least one `RUN` must have already been seen) — this is how "validation binds to
+  the nearest preceding RUN" is implemented, and it works identically whether that `RUN` is
+  inside a `PARALLEL` block or not: `current_run_index` is simply updated to `len(commands) -
+  1` every time a `RUN` line is processed, and every subsequent `Validation` object is stamped
+  with whatever `current_run_index` currently holds.
 - After the loop: `test_name is None`, `not commands`, `in_parallel` (still open), and `not
   end_seen` are checked and raise `ParseError` for missing `TEST`, missing `RUN`, an unclosed
   `PARALLEL` block, and missing `END` respectively.
@@ -296,15 +311,25 @@ validations)` — the only difference between the two call sites in `parse_text(
 the resulting `Validation.stream` field and read by `validator.check_validation()` to pick
 `result.stdout_text()` vs `result.stderr_text()`.
 
+**`EXPECT_REGEX` / `EXPECT_REGEX_STDERR`:** one shared `elif keyword in ("EXPECT_REGEX",
+"EXPECT_REGEX_STDERR"):` branch handles both — `tokens` must be exactly `["EXPECT_REGEX(_STDERR)",
+"<pattern>"]`, and the pattern is compiled with `re.compile(pattern)` immediately (wrapped in a
+`try/except re.error`, raising `ParseError` with the underlying `re.error` message on failure)
+so a malformed regex is caught at parse time, before any command ever runs. The resulting
+`Validation(kind=REGEX, pattern=pattern, stream=...)` stores the raw, unsubstituted pattern
+string — `{{variable}}` placeholders inside it are resolved later, at validation time, by
+`validator.check_validation()`/`describe_validation()`, not here.
+
 **Internal representation:** `TestCase` (name, `commands: List[str]`, `validations:
 List[Validation]`, `source_path`, `loop_counts: List[int]`, `parallel_group_id:
-List[Optional[int]]`) and `Validation` (kind, `run_index`, `line_no`, `stream` (`"stdout"` or
-`"stderr"`), plus kind-specific optional fields: `expected_exit`, `field`/`value`,
-`offset`/`expected_byte`/`hex_string`). Both are plain `@dataclass`es — no methods beyond what
-`@dataclass` auto-generates. `kind` is one of the module-level string constants `EXIT`,
-`TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`, `TEXT_NOT_EMPTY`, `BYTE`, `HEX` — these are internal
-only, never surfaced to the test author (`EXPECT` and `EXPECT_STDERR` produce the exact same
-`kind` values, distinguished only by `stream`).
+List[Optional[int]]`, `capture_names: List[Optional[str]]`) and `Validation` (kind,
+`run_index`, `line_no`, `stream` (`"stdout"` or `"stderr"`), plus kind-specific optional
+fields: `expected_exit`, `field`/`value`, `offset`/`expected_byte`/`hex_string`, `pattern`).
+Both are plain `@dataclass`es — no methods beyond what `@dataclass` auto-generates. `kind` is
+one of the module-level string constants `EXIT`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`,
+`TEXT_NOT_EMPTY`, `BYTE`, `HEX`, `REGEX` — these are internal only, never surfaced to the test
+author (`EXPECT`/`EXPECT_STDERR` produce the same `kind` values distinguished only by
+`stream`; likewise `EXPECT_REGEX`/`EXPECT_REGEX_STDERR` both produce `kind=REGEX`).
 
 **Error handling:** every rejection path raises `parser.ParseError`, a subclass of `Exception`
 that prepends `"line N: "` and appends the offending raw line (`\n    > <line>`) to the
@@ -323,17 +348,20 @@ TestCase
  ├── validations: List[Validation]   (in declared order)
  │    └── Validation
  │         ├── kind: str             (EXIT / TEXT_CONTAINS / TEXT_NOT_CONTAINS /
- │         │                          TEXT_NOT_EMPTY / BYTE / HEX)
+ │         │                          TEXT_NOT_EMPTY / BYTE / HEX / REGEX)
  │         ├── run_index: int        (index into `commands` this validation is bound to)
  │         ├── line_no: int
- │         ├── stream: str           ("stdout" for EXPECT, "stderr" for EXPECT_STDERR)
+ │         ├── stream: str           ("stdout" for EXPECT/EXPECT_REGEX, "stderr" for
+ │         │                          EXPECT_STDERR/EXPECT_REGEX_STDERR)
  │         └── kind-specific fields  (expected_exit | field+value | offset+expected_byte |
- │                                    offset+hex_string)
+ │                                    offset+hex_string | pattern)
  ├── source_path: Optional[str]
  ├── loop_counts: List[int]          (same length/order as `commands`; 1 unless LOOP <n>)
- └── parallel_group_id: List[Optional[int]]  (same length/order as `commands`; None for a
-                                                normal RUN, or a shared int for every RUN
-                                                inside the same PARALLEL block)
+ ├── parallel_group_id: List[Optional[int]]  (same length/order as `commands`; None for a
+ │                                              normal RUN, or a shared int for every RUN
+ │                                              inside the same PARALLEL block)
+ └── capture_names: List[Optional[str]]  (same length/order as `commands`; None unless that
+                                            RUN used CAPTURE <name>)
 ```
 
 There is no separate "steps" or "result" substructure — commands and validations are two
@@ -341,10 +369,10 @@ parallel flat lists linked only by `Validation.run_index`. This is deliberately 
 the `steps: [{command, validations}]` shape one might expect; it was chosen because it lets
 `TestRunner.run()` iterate command indices generically (sequential execution for `LOOP`-only
 commands, `ThreadPoolExecutor`-submitted for commands sharing a `parallel_group_id`) rather
-than needing a richer nested tree. `loop_counts`/`parallel_group_id` are two more flat lists in
-that same shape, extended this way (rather than folding them into `Validation` or introducing
-a new `Command` dataclass) specifically so the existing `run_index`-based binding logic needed
-no changes at all when this feature was added.
+than needing a richer nested tree. `loop_counts`/`parallel_group_id`/`capture_names` are three
+more flat lists in that same shape, extended this way (rather than folding them into
+`Validation` or introducing a new `Command` dataclass) specifically so the existing
+`run_index`-based binding logic needed no changes at all when these features were added.
 
 ---
 
@@ -390,14 +418,41 @@ for each command index i (0..n-1), in file order:
         wait for all of them (future.result()) before continuing past the group
 
 execute_slot(i):
+    cmd = self.variable_manager.substitute(test_case.commands[i])   # JIT, see below
     for iteration in 1..loop_counts[i]:
-        result = self.executor.run(commands[i])          # one real CommandExecutor.run() call
+        result = self.executor.run(cmd)          # one real CommandExecutor.run() call
         for v in validations bound to index i:
             passed, message = check_validation(v, result, self.variable_manager)
             update per-validation pass/fail counts, last_message, first_failure_by_vid
     results[i] = the LAST iteration's CommandResult
+    if capture_names[i]: self.variable_manager.set(capture_names[i], results[i].stdout_text().strip())
     loop_infos[i] = None if loop_count == 1 and not parallel, else a summary dict
 ```
+
+**Why substitution happens per-command, not all upfront:** an earlier version substituted
+every command's `{{...}}` placeholders in one list comprehension before any command executed
+at all. `RUN ... CAPTURE <name>` broke that assumption — a later `RUN` might reference a
+`{{name}}` that only exists *after* an earlier `RUN` has actually run. `execute_slot(i)` now
+calls `self.variable_manager.substitute(test_case.commands[i])` itself, right before that
+command's own iterations begin, so by the time a later index's substitution runs, any earlier
+index's `CAPTURE` (sequential order) has already landed in `self.variable_manager`. The
+tradeoff: an unresolved `{{name}}` in command 3 is no longer caught before command 1 runs —
+it's only discovered once execution reaches command 3, meaning commands 1 and 2 (and any real
+side effects) will already have happened. This is documented in `run()`'s docstring and in
+USER_GUIDE.md's Section 10c as an accepted, necessary consequence of supporting `CAPTURE` at
+all — there is no way to know an unbound `{{name}}` will fail without either running the
+capturing command first, or building a separate static dependency-order checker (deliberately
+not built, to avoid a second, parallel notion of "will this resolve" that could drift from
+actual runtime behavior).
+
+**Capturing (`capture_names[i]`):** after `execute_slot(i)`'s loop finishes, if that index used
+`CAPTURE <name>`, `self.variable_manager.set(name, last_result.stdout_text().strip())` stores
+it. This happens strictly after all of that RUN's own iterations and validations are done — a
+RUN's own bound `EXPECT*` lines never see their own RUN's capture, only a *later* RUN/EXPECT
+can. `VariableManager.set()` simply overwrites/adds into the same dict `get()`/`substitute()`
+read from, so a captured variable is indistinguishable from a `common_variables.json` one to
+every downstream consumer (`check_validation()`, `describe_validation()`, the next
+`execute_slot()` call).
 
 **Why per-iteration validation, not "run everything, then validate":** `check_validation()` is
 called immediately after each iteration's `CommandExecutor.run()`, inside the same loop —
@@ -427,6 +482,17 @@ sequentially). No new dependency was introduced — `concurrent.futures` is stdl
   different indices of the same Python list need no additional locking (CPython's GIL makes
   each individual `list.__setitem__` atomic, and there is no overlap between which indices
   different threads write to).
+- `VariableManager` — `get()`/`set()`/`load()` each hold `self._lock` (a plain
+  `threading.Lock`) around their dict access, since `PARALLEL` makes concurrent
+  reads (`substitute()` during another RUN's JIT substitution) and writes (`CAPTURE`) to the
+  same `VariableManager` genuinely possible. `substitute()` itself does not hold the lock for
+  its whole regex pass -- it calls `self.get()` once per `{{name}}` match, each such call
+  independently locked -- so it does not provide snapshot-consistent atomicity across a single
+  substitution if another thread races a `set()` mid-substitution, but each individual
+  name's value is never read torn/partially-written. Two `RUN`s in the same `PARALLEL` block
+  should not `CAPTURE` into the *same* name (documented in USER_GUIDE.md as a "don't do this"
+  rather than prevented outright); if they do, the lock prevents corruption but not a
+  last-write-wins race on which value ends up stored.
 
 **First-failure tracking, at two granularities:** `execute_slot()` tracks
 `first_failure_by_vid` — the first iteration each *individual* bound validation failed on
@@ -494,12 +560,16 @@ files afterward.
 `framework/validator.py`:
 
 - **`check_validation(v, result, variable_manager=None) -> (bool, str)`** — the actual
-  per-kind comparison logic (all six kinds: `EXIT`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`,
-  `TEXT_NOT_EMPTY`, `BYTE`, `HEX`, as one `if`/`elif` chain) against a **single** `Validation`
-  and a **single** `CommandResult`. This is the one place stream selection happens for text
-  validations: `text = result.stderr_text() if v.stream == "stderr" else
+  per-kind comparison logic (all seven kinds: `EXIT`, `TEXT_CONTAINS`, `TEXT_NOT_CONTAINS`,
+  `TEXT_NOT_EMPTY`, `BYTE`, `HEX`, `REGEX`, as one `if`/`elif` chain) against a **single**
+  `Validation` and a **single** `CommandResult`. This is the one place stream selection happens
+  for text/regex validations: `text = result.stderr_text() if v.stream == "stderr" else
   result.stdout_text()`. Public (no leading underscore) specifically so `TestRunner.run()` can
   call it directly, once per loop iteration, for a `LOOP > 1` `RUN` — see Section 3/14.
+  The `REGEX` branch substitutes `v.pattern` via `variable_manager` (if given) before calling
+  `re.search()`, wrapped in `try/except re.error` — a pattern that compiled fine at parse time
+  (before substitution) could still become invalid after a variable's value is inserted; that
+  case fails the validation with a clear message rather than raising out of `check_validation()`.
 - **`validate(test_case, results, variable_manager=None)`** — the `LOOP == 1` path: a thin
   loop over `test_case.validations` calling `check_validation()` exactly once per validation,
   collecting `(bool, str)` pairs and an overall `all_passed`. This function's behavior and
@@ -513,7 +583,7 @@ files afterward.
   finer-grained control than `validate()`'s "one CommandResult per command" shape provides.
 - **`describe_validation(v, variable_manager=None) -> str`** — a human-readable label for a
   `Validation` with no `CommandResult` involved at all (e.g. `'Exit code == 0'`, `'"Model
-  Number" contains "KIOXIA"'`). Used only by `TestRunner.run()` to build the aggregate
+  Number" contains "Samsung"'`). Used only by `TestRunner.run()` to build the aggregate
   `"<label> across N iterations: X passed, Y failed"` message for a `LOOP > 1` `RUN` — there's
   no single `CommandResult` to hand `check_validation()` for "the whole loop," so the label and
   the pass/fail counts are assembled separately. Deliberately duplicates the small "base
@@ -643,32 +713,52 @@ common_variables.json (or --config-specified variables.file)
 VariableManager.load()  -- json.load(), must be a dict, else ValueError
         |
         v
-VariableManager.get(name) / .substitute(text)
+VariableManager.get(name) / .set(name, value) / .substitute(text)
+        |                        ^
+        |                        |
+        v                        |
+TestRunner.run(): execute_slot(i) substitutes test_case.commands[i] JIT, then,
+if capture_names[i], calls vm.set(name, last_result.stdout_text().strip())
         |
         v
-TestRunner.run(): commands = [vm.substitute(c) for c in test_case.commands]
-Validator.validate(): value = vm.substitute(v.value)  (only for TEXT_CONTAINS)
+check_validation(): value/pattern = vm.substitute(v.value / v.pattern)  (TEXT_CONTAINS, REGEX)
         |
         v
-Resolved command string handed to CommandExecutor.run(), or resolved value compared
-during validation
+Resolved command string handed to CommandExecutor.run(), or resolved value/pattern
+compared during validation
 ```
 
 - **Loading:** `VariableManager(variables_file)` calls `self.load()` in `__init__` if a path
   is given; `load()` requires the file to exist and to parse as a JSON *object* (a JSON array
-  or scalar raises `ValueError`).
+  or scalar raises `ValueError`). Passing `None` (or a nonexistent path) constructs a
+  `VariableManager` with an empty `_values` dict and no error — `TestRunner.__init__` always
+  constructs one, even with nothing to load, specifically so `RUN ... CAPTURE` always has
+  somewhere to store into regardless of whether a variables file exists on disk.
 - **Lookup:** `get(name)` raises `VariableError` if `name` isn't a key in the loaded dict;
-  otherwise returns the raw JSON value (str, int, float, bool, list, dict — whatever JSON
-  allows) unmodified.
+  otherwise returns the raw JSON (or captured) value (str, int, float, bool, list, dict —
+  whatever JSON allows, or whatever `set()` was called with) unmodified.
+- **Runtime capture:** `set(name, value)` stores/overwrites a variable at runtime — this is
+  the only way a value can enter `_values` outside of `load()`. Used exclusively by
+  `TestRunner.run()`'s `execute_slot()`, once per `RUN` that used `CAPTURE <name>`, with
+  `value` always a `str` (the last iteration's stripped stdout) in current usage, though
+  `set()` itself doesn't enforce that.
 - **Substitution:** `substitute(text)` uses a single compiled regex,
   `_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")`, matching `{{name}}` (with
   optional internal whitespace around `name`) and replacing each match with `str(self.get(name))`.
   It short-circuits (`return text` unchanged) if `"{{"` isn't present at all, avoiding a
   regex pass on strings with no placeholders.
+- **Thread safety:** `get()`/`set()`/`load()` each acquire `self._lock` (`threading.Lock`)
+  around their read/write of `_values`. Needed because `PARALLEL` makes concurrent
+  `substitute()` (read, via `get()`) and `CAPTURE` (write, via `set()`) calls against the same
+  `VariableManager` instance genuinely possible across threads — see Section 7a.
 - **Supported types:** any valid JSON value can be a variable's value; it's coerced to `str()`
   only at substitution time, so a variable never *has* to be a string in the JSON file itself.
 - **Missing variables:** `get()`/`substitute()` raise `VariableError` immediately on the first
-  unknown name — there is no partial substitution or default-value fallback.
+  unknown name — there is no partial substitution or default-value fallback. For a
+  `CAPTURE`-dependent reference, this is only ever raised once execution actually reaches the
+  referencing `RUN` (see Section 7a's "JIT substitution" note) — not upfront the way a
+  purely-`common_variables.json`-driven `.nvtest` file's references effectively were before
+  `CAPTURE` existed.
 - **Adding future variable functionality:** any new capability (nested substitution, escaping,
   a different placeholder syntax) belongs entirely inside `variable_manager.py` — nothing
   outside it (parser, validator, runner) needs to change as long as `substitute()`'s
@@ -900,12 +990,26 @@ parser's structural rules (min-2-`RUN`, no nesting, unclosed block). `expect_std
 validates_and_excludes_stdout()` covers `EXPECT_STDERR` matching plus confirming a plain
 `EXPECT` on the same `RUN` still only sees stdout.
 
+**CAPTURE/EXPECT_REGEX testing:** `capture_variable_available_to_later_run()` covers the basic
+capture-then-reference-later flow (TC013). `capture_works_without_variables_file()` covers
+construction with a nonexistent variables path, proving `CAPTURE` doesn't depend on
+`common_variables.json` existing at all. `capture_forward_reference_to_undefined_variable_
+errors_clearly()` builds a temp `.nvtest` referencing a `{{name}}` never `CAPTURE`d anywhere,
+asserting `VariableError` and that no `.log` file is produced. `parallel_capture_is_thread_
+safe()` runs two concurrent `RUN`s inside a `PARALLEL` block, each `CAPTURE`ing into a
+*different* variable, and confirms both values are correctly available afterward (a
+regression test for the `VariableManager` locking added alongside this feature).
+`expect_regex_matches_stdout_and_stderr()` covers TC014 (`EXPECT_REGEX`/
+`EXPECT_REGEX_STDERR`); `expect_regex_rejects_invalid_pattern_at_parse_time()` confirms a
+malformed pattern is a `ParseError`, not a crash.
+
 **Manually verifying a change:**
 ```bash
 python3 -m pyflakes framework/*.py run.py   # lint (no unused imports/dead code)
 python3 run.py                              # full internal self-verification suite
 python3 run.py tests/TC001_success.nvtest   # spot-check a real CLI invocation
 python3 run.py tests/TC011_parallel_stress.nvtest  # spot-check LOOP/PARALLEL
+python3 run.py tests/TC013_capture_variable.nvtest # spot-check CAPTURE
 find . -name "*.bin"                        # must always be empty
 ```
 
@@ -1057,3 +1161,20 @@ Confirmed by direct inspection of the current implementation — nothing here is
   suite"** — there is no separate, lightweight "show usage" path for zero arguments; this is
   long-standing, intentional behavior (documented in `run.py`'s own module docstring) rather
   than an oversight, but is worth knowing before scripting around `run.py` with no arguments.
+- **`CAPTURE` only stores stdout, always as a stripped string** — there is no `CAPTURE_STDERR`,
+  and `VariableManager.set()` is called with `last_result.stdout_text().strip()` specifically,
+  not the raw bytes. Adding stderr capture would follow the same shape (a `CAPTURE_STDERR
+  <name>` modifier, or a stream-selecting variant of the existing one) but doesn't exist today.
+- **Substitution is no longer fully upfront** (see Section 7a's "JIT substitution" note) —
+  this is a deliberate, necessary tradeoff for `CAPTURE` to work at all, but it does mean a
+  `.nvtest` file with a typo'd `{{name}}` in its *last* `RUN` will still execute every earlier
+  `RUN` (with real side effects) before the typo is caught. No static dependency-order checker
+  was built to catch this before execution begins, to avoid a second, parallel notion of
+  "will this resolve" that could drift from actual runtime substitution behavior.
+- **No protection against two `PARALLEL`-block `RUN`s `CAPTURE`ing into the same name** — the
+  underlying dict write is safe (see Section 12's locking), but which value ends up stored is
+  a last-write-wins race, undetected and unwarned-about by the parser. Documented as a "don't
+  do this" in USER_GUIDE.md rather than statically prevented.
+- **`EXPECT_REGEX`/`EXPECT_REGEX_STDERR` use `re.search()`, not `re.fullmatch()`** — matching
+  anywhere in the output is sufficient to pass; there's no dedicated "must match the entire
+  output" mode short of the test author writing `^...$` themselves.

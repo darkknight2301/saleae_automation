@@ -7,7 +7,8 @@ Design intent (Phase 2):
   in runner.py, which refuses to even call this parser on the wrong file type.
 - The DSL is intentionally tiny and line-oriented: one statement per line,
   each line starts with a keyword (TEST, RUN, EXPECT_EXIT, EXPECT,
-  EXPECT_STDERR, EXPECT_BYTE, EXPECT_HEX, PARALLEL, END_PARALLEL, END).
+  EXPECT_STDERR, EXPECT_BYTE, EXPECT_HEX, EXPECT_REGEX, EXPECT_REGEX_STDERR,
+  PARALLEL, END_PARALLEL, END).
   There is no branching or expression language -- this is a manual-test-case
   format, not a programming language.
 - Parsing is strict and deterministic: unknown keywords, wrong argument
@@ -41,8 +42,22 @@ Stderr validation addition:
 - `EXPECT_STDERR "<field>" CONTAINS|NOT_CONTAINS|NOT_EMPTY ...` is
   identical in grammar to EXPECT, but checks the bound command's stderr
   instead of its stdout (plain EXPECT never looked at stderr at all).
+
+Variable capture addition:
+- `RUN "<command>" [LOOP <n>] [CAPTURE <name>]` -- CAPTURE stores that
+  RUN's stdout (last iteration, if LOOP is also used) into a runtime
+  variable `<name>`, which later RUN/EXPECT ... CONTAINS statements can
+  then reference as `{{name}}`, exactly like a common_variables.json
+  variable. LOOP and CAPTURE are independent, order-insensitive modifiers.
+
+Regex validation addition:
+- `EXPECT_REGEX "<pattern>"` / `EXPECT_REGEX_STDERR "<pattern>"` check
+  whether `<pattern>` (a Python `re` pattern) matches anywhere in the
+  bound command's stdout/stderr. The pattern is validated (compiled) at
+  parse time so a malformed regex is a ParseError, not a runtime surprise.
 """
 
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -74,6 +89,9 @@ TEXT_NOT_CONTAINS = "TEXT_NOT_CONTAINS"
 TEXT_NOT_EMPTY = "TEXT_NOT_EMPTY"
 BYTE = "BYTE"
 HEX = "HEX"
+REGEX = "REGEX"
+
+_CAPTURE_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 
 _TEXT_OPERATORS = {"CONTAINS", "NOT_CONTAINS", "NOT_EMPTY"}
 _TEXT_KIND_BY_OPERATOR = {
@@ -85,8 +103,8 @@ _TEXT_KIND_BY_OPERATOR = {
 
 @dataclass
 class Validation:
-    """One EXPECT_EXIT / EXPECT / EXPECT_STDERR / EXPECT_BYTE / EXPECT_HEX
-    statement.
+    """One EXPECT_EXIT / EXPECT / EXPECT_STDERR / EXPECT_BYTE / EXPECT_HEX /
+    EXPECT_REGEX / EXPECT_REGEX_STDERR statement.
 
     `run_index` binds this validation to the output of a specific RUN
     statement -- the nearest RUN that appeared above it in the file. This
@@ -102,11 +120,13 @@ class Validation:
     # TEXT_* (EXPECT / EXPECT_STDERR)
     field: Optional[str] = None
     value: Optional[str] = None
-    stream: str = "stdout"  # "stdout" (EXPECT) or "stderr" (EXPECT_STDERR)
+    stream: str = "stdout"  # "stdout" (EXPECT/EXPECT_REGEX) or "stderr" (*_STDERR variants)
     # BYTE / HEX
     offset: Optional[int] = None
     expected_byte: Optional[int] = None
     hex_string: Optional[str] = None
+    # REGEX
+    pattern: Optional[str] = None
 
 
 @dataclass
@@ -120,10 +140,14 @@ class TestCase:
      |-- loop_counts        : list[int], same length/order as `commands`;
      |                         1 unless that RUN used "LOOP <n>"
      |-- parallel_group_id  : list[Optional[int]], same length/order as
-                              `commands`; None for a normal sequential RUN,
-                              or a shared int for every RUN inside the same
-                              PARALLEL block (so the runner knows which
-                              commands to execute concurrently together)
+     |                        `commands`; None for a normal sequential RUN,
+     |                        or a shared int for every RUN inside the same
+     |                        PARALLEL block (so the runner knows which
+     |                        commands to execute concurrently together)
+     |-- capture_names      : list[Optional[str]], same length/order as
+                              `commands`; None unless that RUN used
+                              "CAPTURE <name>", in which case its stdout is
+                              stored as a runtime variable of that name
     """
 
     name: str
@@ -132,6 +156,7 @@ class TestCase:
     source_path: Optional[str] = None
     loop_counts: List[int] = field(default_factory=list)
     parallel_group_id: List[Optional[int]] = field(default_factory=list)
+    capture_names: List[Optional[str]] = field(default_factory=list)
 
 
 def _split_tokens(line: str, line_no: int) -> List[str]:
@@ -198,6 +223,7 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
     validations: List[Validation] = []
     loop_counts: List[int] = []
     parallel_group_id: List[Optional[int]] = []
+    capture_names: List[Optional[str]] = []
     current_run_index = -1  # -1 means "no RUN encountered yet"
     statements_seen = 0  # non-blank lines processed so far
 
@@ -262,18 +288,39 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
         elif keyword == "RUN":
             if test_name is None:
                 raise ParseError("RUN must come after TEST", i, raw_line)
-            if len(tokens) not in (2, 4):
-                raise ParseError('expected: RUN "<command>" [LOOP <n>]', i, raw_line)
+            if len(tokens) < 2 or (len(tokens) - 2) % 2 != 0:
+                raise ParseError('expected: RUN "<command>" [LOOP <n>] [CAPTURE <name>]', i, raw_line)
             loop_count = 1
-            if len(tokens) == 4:
-                if tokens[2] != "LOOP":
-                    raise ParseError('expected: RUN "<command>" LOOP <n>', i, raw_line)
-                loop_count = _parse_int_maybe_hex(tokens[3], i, raw_line, "RUN ... LOOP")
-                if loop_count < 1:
-                    raise ParseError("LOOP count must be >= 1", i, raw_line)
+            capture_name = None
+            seen_modifiers = set()
+            idx = 2
+            while idx < len(tokens):
+                modifier = tokens[idx]
+                modifier_value = tokens[idx + 1]
+                if modifier not in ("LOOP", "CAPTURE"):
+                    raise ParseError(
+                        f"unknown RUN modifier {modifier!r} (expected LOOP or CAPTURE)", i, raw_line,
+                    )
+                if modifier in seen_modifiers:
+                    raise ParseError(f"RUN modifier {modifier} specified more than once", i, raw_line)
+                seen_modifiers.add(modifier)
+                if modifier == "LOOP":
+                    loop_count = _parse_int_maybe_hex(modifier_value, i, raw_line, "RUN ... LOOP")
+                    if loop_count < 1:
+                        raise ParseError("LOOP count must be >= 1", i, raw_line)
+                else:  # CAPTURE
+                    if not _CAPTURE_NAME_RE.fullmatch(modifier_value):
+                        raise ParseError(
+                            f"invalid CAPTURE variable name {modifier_value!r} "
+                            "(must contain only letters, digits, underscore)",
+                            i, raw_line,
+                        )
+                    capture_name = modifier_value
+                idx += 2
             commands.append(tokens[1])
             loop_counts.append(loop_count)
             parallel_group_id.append(current_parallel_group)
+            capture_names.append(capture_name)
             if in_parallel:
                 parallel_group_run_count += 1
             current_run_index = len(commands) - 1
@@ -296,6 +343,21 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
         elif keyword == "EXPECT_STDERR":
             _parse_text_expect(tokens, i, raw_line, "EXPECT_STDERR", TEXT_CONTAINS,
                                 current_run_index, "stderr", validations)
+
+        elif keyword in ("EXPECT_REGEX", "EXPECT_REGEX_STDERR"):
+            if current_run_index == -1:
+                raise ParseError(f"{keyword} must come after a RUN statement", i, raw_line)
+            if len(tokens) != 2:
+                raise ParseError(f'expected: {keyword} "<pattern>"', i, raw_line)
+            pattern = tokens[1]
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ParseError(f"invalid regex {pattern!r} for {keyword}: {exc}", i, raw_line)
+            validations.append(Validation(
+                kind=REGEX, run_index=current_run_index, line_no=i,
+                pattern=pattern, stream="stderr" if keyword == "EXPECT_REGEX_STDERR" else "stdout",
+            ))
 
         elif keyword == "EXPECT_BYTE":
             if current_run_index == -1:
@@ -352,7 +414,7 @@ def parse_text(text: str, source_path: str = None) -> TestCase:
 
     return TestCase(
         name=test_name, commands=commands, validations=validations, source_path=source_path,
-        loop_counts=loop_counts, parallel_group_id=parallel_group_id,
+        loop_counts=loop_counts, parallel_group_id=parallel_group_id, capture_names=capture_names,
     )
 
 

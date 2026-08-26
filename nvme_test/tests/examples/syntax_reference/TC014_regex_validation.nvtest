@@ -1,0 +1,16 @@
+# Demonstrates EXPECT_REGEX (stdout) and EXPECT_REGEX_STDERR (stderr):
+# each checks whether a Python `re` pattern matches anywhere in the
+# bound command's output. Safe/mock: no hardware needed.
+TEST "Regex Validation"
+
+RUN "printf 'Firmware Revision : 2B2QEXM7\n'"
+
+EXPECT_EXIT 0
+EXPECT_REGEX "Firmware Revision\s*:\s*[A-Z0-9]+"
+
+RUN "python3 -c 'import sys; print(\"Error: field 42 invalid\", file=sys.stderr); sys.exit(1)'"
+
+EXPECT_EXIT 1
+EXPECT_REGEX_STDERR "field \d+ invalid"
+
+END

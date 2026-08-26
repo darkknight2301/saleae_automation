@@ -20,12 +20,20 @@ first validating its values; a value containing shell metacharacters
 (`, $(), ;, |) would execute as part of the RUN command. Escaping every
 substituted value automatically (e.g. shlex.quote()) was considered and
 rejected: it would break the common, legitimate case of a variable
-expanding to a bare, unquoted path (e.g. {{device0}} -> /dev/nvme0).
+expanding to a bare, unquoted path (e.g. {{device}} -> /dev/nvme0).
+
+Runtime capture (RUN ... CAPTURE <name>): in addition to variables loaded
+once from a JSON file, TestRunner calls set() to store a RUN's captured
+stdout as a variable, at runtime, mid-test. get()/set()/substitute() are
+lock-protected so a PARALLEL block (concurrent RUNs, each possibly
+capturing into or substituting from the same VariableManager) can't race
+on the underlying dict.
 """
 
 import json
 import os
 import re
+import threading
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
 
@@ -39,6 +47,7 @@ class VariableManager:
     def __init__(self, variables_file: str = None):
         self.variables_file = variables_file
         self._values = {}
+        self._lock = threading.Lock()
         if variables_file:
             self.load(variables_file)
 
@@ -49,13 +58,22 @@ class VariableManager:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError(f"Variables file must contain a JSON object: {variables_file}")
-        self._values = data
+        with self._lock:
+            self._values = data
         self.variables_file = variables_file
 
     def get(self, name: str):
-        if name not in self._values:
-            raise VariableError(f"Unknown variable {{{{{name}}}}} (not found in {self.variables_file})")
-        return self._values[name]
+        with self._lock:
+            if name not in self._values:
+                raise VariableError(f"Unknown variable {{{{{name}}}}} (not found in {self.variables_file})")
+            return self._values[name]
+
+    def set(self, name: str, value):
+        """Store or overwrite a variable at runtime (e.g. RUN ... CAPTURE
+        <name>). Takes precedence over any same-named value loaded from
+        the JSON variables file for the rest of this run."""
+        with self._lock:
+            self._values[name] = value
 
     def substitute(self, text: str) -> str:
         """Replace every {{name}} in `text` with its loaded value (as str).

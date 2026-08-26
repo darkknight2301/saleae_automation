@@ -1,0 +1,19 @@
+# Requires: nvme-cli installed AND a real NVMe controller at {{device}}.
+# Read-only commands; safe on real hardware.
+#
+# Demonstrates capturing the firmware revision from a real `nvme id-ctrl`
+# call and referencing it in a later step's log/validation, plus using
+# EXPECT_REGEX against real command output.
+TEST "Capture Firmware + Regex Validation (real hardware)"
+
+RUN "nvme id-ctrl {{device}}" CAPTURE identify_output
+
+EXPECT_EXIT 0
+EXPECT_REGEX "Firmware Revision\s*:\s*\S+"
+
+RUN "echo Captured identify output length check: {{identify_output}}"
+
+EXPECT_EXIT 0
+EXPECT "Captured identify output length check" NOT_EMPTY
+
+END

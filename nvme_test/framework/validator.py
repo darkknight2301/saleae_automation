@@ -16,11 +16,12 @@ Design intent (Phase 2):
   module docstring notes below each helper for the exact semantics.
 """
 
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
 from .parser import (
-    TestCase, EXIT, TEXT_CONTAINS, TEXT_NOT_CONTAINS, TEXT_NOT_EMPTY, BYTE, HEX,
+    TestCase, EXIT, TEXT_CONTAINS, TEXT_NOT_CONTAINS, TEXT_NOT_EMPTY, BYTE, HEX, REGEX,
 )
 
 
@@ -115,6 +116,25 @@ def check_validation(v, result, variable_manager=None) -> Tuple[bool, str]:
         if not passed:
             message += f" (got {actual.hex()})"
 
+    elif v.kind == REGEX:
+        text = result.stderr_text() if v.stream == "stderr" else result.stdout_text()
+        stream_suffix = " (stderr)" if v.stream == "stderr" else ""
+        pattern = v.pattern
+        if variable_manager is not None:
+            pattern = variable_manager.substitute(pattern)
+        message = f'matches regex "{pattern}"{stream_suffix}'
+        try:
+            passed = re.search(pattern, text) is not None
+        except re.error as exc:
+            # A {{variable}}-substituted pattern could turn out invalid at
+            # runtime even though the literal, unsubstituted pattern
+            # compiled fine at parse time -- report as a failed match with
+            # a clear reason rather than crashing the whole test run.
+            passed = False
+            message += f" (invalid regex after substitution: {exc})"
+        if not passed and "invalid regex" not in message:
+            message += " (no match found)"
+
     else:  # pragma: no cover - parser never produces unknown kinds
         passed = False
         message = f"Unknown validation kind: {v.kind}"
@@ -182,6 +202,11 @@ def describe_validation(v, variable_manager=None) -> str:
         return f"Byte at offset 0x{v.offset:02x} == 0x{v.expected_byte:02x}"
     elif v.kind == HEX:
         return f"Bytes at offset 0x{v.offset:02x} == {v.hex_string}"
+    elif v.kind == REGEX:
+        pattern = v.pattern
+        if variable_manager is not None:
+            pattern = variable_manager.substitute(pattern)
+        return f'matches regex "{pattern}"{stream_suffix}'
     else:  # pragma: no cover
         return f"Unknown validation kind: {v.kind}"
 

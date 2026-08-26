@@ -75,11 +75,14 @@ class TestRunner:
         self.log = FrameworkLogger(level=self.config.log_level, run_dir=self.run_dir)
 
         variables_path = variables_path or self.config.variables_file
-        self.variable_manager = None
         if variables_path and os.path.exists(variables_path):
             self.variable_manager = VariableManager(variables_path)
             self.log.debug(f"Loaded variables from {variables_path}")
         else:
+            # Always construct a VariableManager, even with nothing loaded from
+            # disk, so RUN ... CAPTURE <name> has somewhere to store captured
+            # values regardless of whether a variables file exists at all.
+            self.variable_manager = VariableManager(None)
             self.log.debug(f"No variables file loaded (looked for {variables_path})")
 
         self.parser = TestParser()
@@ -107,23 +110,30 @@ class TestRunner:
         drive e.g. "id-ctrl looped 1000x" concurrently with "reset looped
         100x" (see USER_GUIDE.md's Parallel/Loop Execution section).
 
+        A RUN using `CAPTURE <name>` stores its (last iteration's) stdout,
+        stripped, as a runtime variable -- available to any LATER RUN or
+        EXPECT ... CONTAINS via {{name}}, exactly like a variable loaded
+        from common_variables.json. Substitution happens per-command,
+        immediately before that command's own iterations run (not all
+        upfront for every command at once), specifically so this works.
+
         Raises:
             UnsupportedFileTypeError: if `path` does not end in .nvtest.
             ParseError:               if the file's syntax/structure is invalid.
             VariableError:            if a {{name}} placeholder is unresolved.
-            (All raised before any .log file is written for this test.)
+            (All raised before any .log file is written for this test --
+            except a VariableError from a RUN referencing a variable
+            CAPTUREd by an earlier RUN in the same file, which can only be
+            detected once execution reaches that RUN; see RUN ... CAPTURE
+            below.)
         """
         check_extension(path)
         self.log.debug(f"Parsing {path}")
         test_case = self.parser.parse(path)
 
-        commands = test_case.commands
-        if self.variable_manager is not None:
-            commands = [self.variable_manager.substitute(c) for c in commands]
-
         self.log.info(f"Running: {test_case.name}")
 
-        n = len(commands)
+        n = len(test_case.commands)
         validations_by_index = {}
         for v in test_case.validations:
             validations_by_index.setdefault(v.run_index, []).append(v)
@@ -140,7 +150,15 @@ class TestRunner:
         per_index_validation_data = [None] * n
 
         def execute_slot(i):
-            cmd = commands[i]
+            # Substituted here, immediately before this command's own
+            # iterations run -- NOT all upfront for every command at once
+            # -- so a RUN can reference {{name}} captured by an EARLIER
+            # RUN (lower index, already executed) via RUN ... CAPTURE
+            # <name>. This does mean an unresolved {{name}} in a later RUN
+            # is only discovered once execution reaches that RUN, not
+            # before any command runs -- any earlier RUNs' real-world
+            # side effects will already have happened by then.
+            cmd = self.variable_manager.substitute(test_case.commands[i])
             loop_count = test_case.loop_counts[i]
             bound = validations_by_index.get(i, [])
             pass_counts = {id(v): 0 for v in bound}
@@ -164,6 +182,11 @@ class TestRunner:
                         first_failure_by_vid.setdefault(id(v), (iteration, message))
 
             results[i] = last_result
+            capture_name = test_case.capture_names[i]
+            if capture_name:
+                self.variable_manager.set(capture_name, last_result.stdout_text().strip())
+                self.log.debug(f"Captured {{{{{capture_name}}}}} from RUN #{i}")
+
             parallel_group = test_case.parallel_group_id[i]
             if loop_count > 1 or parallel_group is not None:
                 overall_first_failure = min(first_failure_by_vid.values(), default=None,
