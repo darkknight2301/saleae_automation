@@ -90,6 +90,14 @@ TEXT_NOT_EMPTY = "TEXT_NOT_EMPTY"
 BYTE = "BYTE"
 HEX = "HEX"
 REGEX = "REGEX"
+NUM_EQ = "NUM_EQ"
+NUM_NEQ = "NUM_NEQ"
+NUM_GT = "NUM_GT"
+NUM_GE = "NUM_GE"
+NUM_LT = "NUM_LT"
+NUM_LE = "NUM_LE"
+
+NUMERIC_KINDS = {NUM_EQ, NUM_NEQ, NUM_GT, NUM_GE, NUM_LT, NUM_LE}
 
 _CAPTURE_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 
@@ -98,6 +106,10 @@ _TEXT_KIND_BY_OPERATOR = {
     "CONTAINS": TEXT_CONTAINS,
     "NOT_CONTAINS": TEXT_NOT_CONTAINS,
     "NOT_EMPTY": TEXT_NOT_EMPTY,
+}
+_NUMERIC_OPERATORS = {"EQ", "NEQ", "GT", "GE", "LT", "LE"}
+_NUMERIC_KIND_BY_OPERATOR = {
+    "EQ": NUM_EQ, "NEQ": NUM_NEQ, "GT": NUM_GT, "GE": NUM_GE, "LT": NUM_LT, "LE": NUM_LE,
 }
 
 
@@ -176,22 +188,40 @@ def _parse_int_maybe_hex(token: str, line_no: int, line: str, what: str) -> int:
 
 def _parse_text_expect(tokens, i, raw_line, keyword, kind_prefix, current_run_index, stream, validations):
     """Shared grammar for EXPECT and EXPECT_STDERR: "<field>"
-    CONTAINS/NOT_CONTAINS/NOT_EMPTY ["<value>"], differing only in which
-    stream (`stdout`/`stderr`) the resulting Validation checks."""
+    CONTAINS/NOT_CONTAINS/NOT_EMPTY/EQ/NEQ/GT/GE/LT/LE ["<value>"], differing
+    only in which stream (`stdout`/`stderr`) the resulting Validation checks."""
     if current_run_index == -1:
         raise ParseError(f"{keyword} must come after a RUN statement", i, raw_line)
     if len(tokens) < 3:
         raise ParseError(
             f'expected: {keyword} "<field>" CONTAINS "<value>" | '
-            f'{keyword} "<field>" NOT_CONTAINS | {keyword} "<field>" NOT_EMPTY',
+            f'{keyword} "<field>" NOT_CONTAINS | {keyword} "<field>" NOT_EMPTY | '
+            f'{keyword} "<field>" EQ/NEQ/GT/GE/LT/LE <number>',
             i, raw_line,
         )
     field_name = tokens[1]
     operator = tokens[2]
+    if operator in _NUMERIC_OPERATORS:
+        if len(tokens) != 4:
+            raise ParseError(f'expected: {keyword} "<field>" {operator} <number>', i, raw_line)
+        number_token = tokens[3]
+        if "{{" not in number_token:
+            try:
+                float(number_token)
+            except ValueError:
+                raise ParseError(
+                    f"expected a number for {keyword} ... {operator}, got {number_token!r}",
+                    i, raw_line,
+                )
+        validations.append(Validation(
+            kind=_NUMERIC_KIND_BY_OPERATOR[operator], run_index=current_run_index, line_no=i,
+            field=field_name, value=number_token, stream=stream,
+        ))
+        return
     if operator not in _TEXT_OPERATORS:
         raise ParseError(
             f"unknown {keyword} operator {operator!r} "
-            f"(expected CONTAINS, NOT_CONTAINS, or NOT_EMPTY)",
+            f"(expected CONTAINS, NOT_CONTAINS, NOT_EMPTY, EQ, NEQ, GT, GE, LT, or LE)",
             i, raw_line,
         )
     kind = _TEXT_KIND_BY_OPERATOR[operator]

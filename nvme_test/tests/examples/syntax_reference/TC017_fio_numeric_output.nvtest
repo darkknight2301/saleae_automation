@@ -1,0 +1,26 @@
+# Safe: writes only to a regular file under /tmp, never a raw block
+# device. Demonstrates the "run fio, run some command, run fio again,
+# then validate the parsed output parameters numerically" pattern using
+# REAL fio -- not a mock. Each fio RUN pipes its --output-format=json
+# result through a small inline Python snippet that prints clean
+# "field value" lines, which EXPECT ... GE/LE etc. can then parse and
+# compare. Requires: fio installed.
+TEST "FIO Write + Health Check + FIO Read, With Numeric Validation"
+
+RUN "fio --name=w --filename=/tmp/nvme_test_numeric_fio.bin --size=4M --rw=write --bs=4k --numjobs=1 --output-format=json | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"jobs\"][0]; print(\"write_iops\", d[\"write\"][\"iops\"]); print(\"write_bw_kb\", d[\"write\"][\"bw\"])'"
+
+EXPECT_EXIT 0
+EXPECT "write_iops" GE 1
+EXPECT "write_bw_kb" GT 0
+
+RUN "lsblk"
+
+EXPECT_EXIT 0
+
+RUN "fio --name=r --filename=/tmp/nvme_test_numeric_fio.bin --size=4M --rw=read --bs=4k --numjobs=1 --output-format=json | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"jobs\"][0]; print(\"read_iops\", d[\"read\"][\"iops\"]); print(\"read_bw_kb\", d[\"read\"][\"bw\"])'"
+
+EXPECT_EXIT 0
+EXPECT "read_iops" GE 1
+EXPECT "read_bw_kb" GT 0
+
+END

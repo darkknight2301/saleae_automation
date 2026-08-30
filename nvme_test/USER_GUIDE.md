@@ -39,7 +39,8 @@ One statement per line. Blank lines and `#` comments ignored.
 | `PARALLEL` / `END_PARALLEL` | wraps 2+ `RUN` | Every `RUN` inside runs concurrently (one thread each); framework waits for all before continuing. No nesting |
 | `EXPECT_EXIT` | `EXPECT_EXIT <code>` | decimal or `0x..` |
 | `EXPECT` | `EXPECT "<field>" CONTAINS/NOT_CONTAINS/NOT_EMPTY ["<value>"]` | checks **stdout** |
-| `EXPECT_STDERR` | same grammar as `EXPECT` | checks **stderr** |
+| `EXPECT` (numeric) | `EXPECT "<field>" EQ/NEQ/GT/GE/LT/LE <number>` | extracts first number after `<field>` on its line, compares numerically. `<number>` may be `{{var}}` |
+| `EXPECT_STDERR` | same grammar as `EXPECT` (text + numeric) | checks **stderr** |
 | `EXPECT_BYTE` | `EXPECT_BYTE <offset> <byte>` | raw byte at offset |
 | `EXPECT_HEX` | `EXPECT_HEX <offset> "<hexstring>"` | raw byte range |
 | `EXPECT_REGEX` / `EXPECT_REGEX_STDERR` | `EXPECT_REGEX "<pattern>"` | Python `re.search()`, compiled at parse time |
@@ -85,8 +86,8 @@ python3 run.py tests/ --config config/config.yaml
 {"device": "/dev/nvme0", "expected_model": "Samsung", "expected_fw": "ABC123", "min_iops": 100000}
 ```
 
-- Reference with `{{name}}` in a `RUN` command or `EXPECT ... CONTAINS "<value>"` /
-  `EXPECT_REGEX "<pattern>"`.
+- Reference with `{{name}}` in a `RUN` command, `EXPECT ... CONTAINS "<value>"`,
+  `EXPECT ... EQ/NEQ/GT/GE/LT/LE <number>`, or `EXPECT_REGEX "<pattern>"`.
 - `EXPECT_EXIT`, `EXPECT_BYTE`, `EXPECT_HEX` do **not** support `{{...}}`.
 - Missing variable → `VariableError`, reported as `ERROR`, no `.log` written.
 - `RUN "..." CAPTURE <name>` creates/overwrites a variable at runtime from that command's
@@ -95,8 +96,7 @@ python3 run.py tests/ --config config/config.yaml
 - **Substitution is just-in-time**, per `RUN`, right before it executes — not all upfront. A
   bad reference in a later `RUN` is only caught once execution reaches it; earlier `RUN`s will
   already have run.
-- `min_iops` ships in the example file but nothing in the DSL consumes it (no numeric
-  comparison operator exists).
+- `min_iops`: `EXPECT "read_iops" GE {{min_iops}}` — see §7/§8.
 
 ## 6. Command Examples
 
@@ -148,6 +148,24 @@ END_PARALLEL
 See `tests/TC011_parallel_stress.nvtest` (mock) /
 `tests/examples/TC013_parallel_identify_reset_HARDWARE_REQUIRED.nvtest` (real).
 
+FIO → command → FIO with numeric output validation (real fio, safe — targets a `/tmp` file).
+fio's output isn't `field: number`-shaped by default, so `--output-format=json` is piped
+through a small inline Python snippet that prints simple `field value` lines — no fio-specific
+parsing exists in the framework; any command reducible to `field value` lines works the same:
+```text
+RUN "fio --name=w --filename=/tmp/f.bin --size=4M --rw=write --bs=4k --output-format=json | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"jobs\"][0]; print(\"write_iops\", d[\"write\"][\"iops\"])'"
+EXPECT_EXIT 0
+EXPECT "write_iops" GE 1
+
+RUN "lsblk"
+EXPECT_EXIT 0
+
+RUN "fio ... --rw=read ..."   # same JSON-pipe pattern
+EXPECT_EXIT 0
+EXPECT "read_iops" GE 1
+```
+See `tests/TC017_fio_numeric_output.nvtest`.
+
 ## 8. Validation Reference
 
 | Validator | Semantics |
@@ -156,14 +174,17 @@ See `tests/TC011_parallel_stress.nvtest` (mock) /
 | `EXPECT .. CONTAINS` | first line of stdout containing `<field>` must also contain `<value>` |
 | `EXPECT .. NOT_CONTAINS` | `<field>` absent anywhere in stdout |
 | `EXPECT .. NOT_EMPTY` | text after `<field>` (past `:`/`=`) on its line is non-blank |
-| `EXPECT_STDERR ..` | identical semantics, against stderr |
+| `EXPECT .. EQ/NEQ/GT/GE/LT/LE <number>` | first number found after `<field>` on its line, compared numerically |
+| `EXPECT_STDERR ..` | identical semantics (text + numeric), against stderr |
 | `EXPECT_BYTE <off> <byte>` | `stdout[off] == byte` |
 | `EXPECT_HEX <off> "<hex>"` | `stdout[off:off+len]` equals the hex bytes |
 | `EXPECT_REGEX[_STDERR] "<pattern>"` | `re.search(pattern, text)` — not anchored/fullmatch |
 
-Not implemented: `EQUALS`, numeric comparisons (`>=`, etc.). All validations always run; one
-failure anywhere → test `FAIL`. For a `LOOP`ed `RUN`, every iteration is checked, and the
-`.log` shows an aggregate (see §10).
+Numeric example: `EXPECT "read_iops" GE 100000` matches `read_iops : 125000`, `IOPS=125000`,
+etc. — any number after the field text. `<number>` may be `{{var}}` (e.g. `EXPECT "read_iops"
+GE {{min_iops}}`); non-numeric/unresolved or missing-field fails cleanly, not a crash. Not
+implemented: `EQUALS` (exact whole-output match). All validations always run; one failure
+anywhere → test `FAIL`. `LOOP`ed `RUN`s check every iteration and aggregate in the `.log` (§11).
 
 ## 9. Binary Output / Passthru
 
@@ -175,13 +196,7 @@ EXPECT_HEX 0x10 "12345678"
 ```
 - A command's output is hex-dumped in the `.log` automatically **iff** any `EXPECT_BYTE`/`EXPECT_HEX` is bound to it; otherwise shown as text.
 - `EXPECT_BYTE`/`EXPECT_HEX` validate the **raw bytes**, never the rendered hex-dump text.
-- No `.bin` file is ever created — hex dump lives only inside the `.log`.
-```
-BINARY OUTPUT:
-Size: 8 bytes
-
-00000000  01 00 00 00 4e 56 4d 65                          ....NVMe
-```
+- No `.bin` file is ever created — hex dump lives only inside the `.log` (format: `00000000  01 00 00 00 4e 56 4d 65  ....NVMe`, see §11).
 
 ## 10. Running Tests (`run.py`)
 
@@ -253,6 +268,7 @@ applicable), `ITERATIONS RUN:`, `EXIT CODE (last iteration):`, `OUTPUT (last ite
 | `a PARALLEL block must contain at least 2 RUN statements` | only 1 `RUN` inside | add one or remove `PARALLEL` |
 | `invalid regex ...` | bad `re` pattern | fix syntax (Python regex, not shell glob) |
 | `EXPECT_BYTE ... offset beyond N captured bytes` | output shorter than expected | check `BINARY OUTPUT: Size:` |
+| `expected a number for EXPECT ... GE, got '...'` | non-numeric literal after a numeric operator | use a plain number or `{{var}}` |
 
 ## 14. Best Practices
 

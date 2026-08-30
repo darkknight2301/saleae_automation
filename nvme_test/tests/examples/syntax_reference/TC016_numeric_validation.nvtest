@@ -1,0 +1,17 @@
+# Demonstrates numeric-comparison operators on EXPECT: EQ, NEQ, GT, GE, LT,
+# LE. Each finds the first line containing <field>, extracts the first
+# number after it, and compares numerically -- e.g. for parsed fio/SMART
+# output. Safe/mock: no hardware needed.
+TEST "Numeric Validation"
+
+RUN "printf 'read_iops : 125000\nread_bw_kb : 500000\n'"
+
+EXPECT_EXIT 0
+EXPECT "read_iops" GE 100000
+EXPECT "read_iops" LT 200000
+EXPECT "read_iops" GT 100000
+EXPECT "read_iops" LE 125000
+EXPECT "read_bw_kb" EQ 500000
+EXPECT "read_bw_kb" NEQ 1
+
+END

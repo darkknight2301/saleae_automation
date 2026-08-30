@@ -22,6 +22,7 @@ from typing import List, Tuple
 
 from .parser import (
     TestCase, EXIT, TEXT_CONTAINS, TEXT_NOT_CONTAINS, TEXT_NOT_EMPTY, BYTE, HEX, REGEX,
+    NUM_EQ, NUM_NEQ, NUM_GT, NUM_GE, NUM_LT, NUM_LE, NUMERIC_KINDS,
 )
 
 
@@ -53,6 +54,46 @@ def _extract_value_after_field(line: str, field_name: str) -> str:
     idx = line.find(field_name)
     remainder = line[idx + len(field_name):]
     return remainder.strip().lstrip(":=").strip()
+
+
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+_NUMERIC_OP_SYMBOL = {
+    NUM_EQ: "==", NUM_NEQ: "!=", NUM_GT: ">", NUM_GE: ">=", NUM_LT: "<", NUM_LE: "<=",
+}
+
+
+def _extract_first_number_after_field(line: str, field_name: str):
+    """Given a line known to contain `field_name`, return the first
+    number (int/float, as a float) found after it, or None if no number
+    follows. Used by EQ/NEQ/GT/GE/LT/LE, e.g.:
+
+        "read_iops : 12345" with field "read_iops" -> 12345.0
+    """
+    idx = line.find(field_name)
+    remainder = line[idx + len(field_name):]
+    match = _NUMBER_RE.search(remainder)
+    return float(match.group()) if match else None
+
+
+def _format_num(value: float) -> str:
+    """Render a float without a trailing '.0' for whole numbers, so
+    messages read '1000' rather than '1000.0'."""
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def _compare_numbers(kind: str, actual: float, expected: float) -> bool:
+    if kind == NUM_EQ:
+        return actual == expected
+    if kind == NUM_NEQ:
+        return actual != expected
+    if kind == NUM_GT:
+        return actual > expected
+    if kind == NUM_GE:
+        return actual >= expected
+    if kind == NUM_LT:
+        return actual < expected
+    return actual <= expected  # NUM_LE
 
 
 def check_validation(v, result, variable_manager=None) -> Tuple[bool, str]:
@@ -135,6 +176,33 @@ def check_validation(v, result, variable_manager=None) -> Tuple[bool, str]:
         if not passed and "invalid regex" not in message:
             message += " (no match found)"
 
+    elif v.kind in NUMERIC_KINDS:
+        text = result.stderr_text() if v.stream == "stderr" else result.stdout_text()
+        stream_suffix = " (stderr)" if v.stream == "stderr" else ""
+        op_symbol = _NUMERIC_OP_SYMBOL[v.kind]
+        raw_value = v.value
+        if variable_manager is not None:
+            raw_value = variable_manager.substitute(raw_value)
+        try:
+            expected = float(raw_value)
+        except ValueError:
+            passed = False
+            message = (
+                f'"{v.field}" {op_symbol} {raw_value}{stream_suffix} '
+                "(invalid numeric value after substitution)"
+            )
+        else:
+            line = _find_field_line(text, v.field)
+            actual = _extract_first_number_after_field(line, v.field) if line is not None else None
+            message = f'"{v.field}" {op_symbol} {_format_num(expected)}{stream_suffix}'
+            if actual is None:
+                passed = False
+                message += " (field not found in output)"
+            else:
+                passed = _compare_numbers(v.kind, actual, expected)
+                if not passed:
+                    message += f" (got {_format_num(actual)})"
+
     else:  # pragma: no cover - parser never produces unknown kinds
         passed = False
         message = f"Unknown validation kind: {v.kind}"
@@ -207,6 +275,11 @@ def describe_validation(v, variable_manager=None) -> str:
         if variable_manager is not None:
             pattern = variable_manager.substitute(pattern)
         return f'matches regex "{pattern}"{stream_suffix}'
+    elif v.kind in NUMERIC_KINDS:
+        value = v.value
+        if variable_manager is not None:
+            value = variable_manager.substitute(value)
+        return f'"{v.field}" {_NUMERIC_OP_SYMBOL[v.kind]} {value}{stream_suffix}'
     else:  # pragma: no cover
         return f"Unknown validation kind: {v.kind}"
 

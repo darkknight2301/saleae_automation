@@ -758,6 +758,105 @@ def expect_regex_rejects_invalid_pattern_at_parse_time():
     print("[PASS] expect_regex_rejects_invalid_pattern_at_parse_time")
 
 
+def numeric_validation_all_operators():
+    """TC016: EQ/NEQ/GT/GE/LT/LE all compare correctly against a
+    parsed numeric field."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC016_numeric_validation.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        messages = [m for _, m in result.validation_lines]
+        for op in (">= 100000", "< 200000", "> 100000", "<= 125000", "== 500000", "!= 1"):
+            assert any(op in m for m in messages), f"missing {op!r} in {messages}"
+        print(f"[PASS] numeric_validation_all_operators -> {result.log_path}")
+    finally:
+        test_runner.close()
+
+
+def numeric_validation_supports_variable_substitution():
+    """{{min_iops}} (previously unconsumed anywhere) must resolve inside a
+    numeric comparison, and a failing comparison reports the actual
+    parsed value."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "numeric_var.nvtest")
+        with open(path, "w") as f:
+            f.write(
+                'TEST "Numeric With Variable"\n'
+                'RUN "printf \'read_iops : 50000\\n\'"\n'
+                "EXPECT_EXIT 0\n"
+                'EXPECT "read_iops" GE {{min_iops}}\n'
+                "END\n"
+            )
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            result = test_runner.run(path)
+            assert result.status == "FAIL", f"expected FAIL, got {result.status}"
+            messages = [m for _, m in result.validation_lines]
+            assert any(">= 100000" in m and "(got 50000)" in m for m in messages), messages
+            print(f"[PASS] numeric_validation_supports_variable_substitution -> {result.log_path}")
+        finally:
+            test_runner.close()
+
+
+def numeric_validation_field_not_found_and_bad_value():
+    """Missing field and a non-numeric expected value must fail clearly,
+    not crash."""
+    from framework.parser import parse_text, ParseError
+
+    # bad literal number at parse time
+    try:
+        parse_text('TEST "x"\nRUN "echo hi"\nEXPECT "iops" GE notanumber\nEND\n')
+        raise AssertionError("expected ParseError for non-numeric literal")
+    except ParseError:
+        pass
+
+    # field not present in output -> runtime FAIL, not a crash
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC001_success.nvtest")
+        assert result.status == "PASS"  # sanity: unrelated file still fine
+    finally:
+        test_runner.close()
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "missing_field.nvtest")
+        with open(path, "w") as f:
+            f.write(
+                'TEST "Missing Field"\n'
+                'RUN "echo nothing_relevant_here"\n'
+                "EXPECT_EXIT 0\n"
+                'EXPECT "iops" GE 100\n'
+                "END\n"
+            )
+        test_runner = TestRunner(config=ConfigManager())
+        try:
+            result = test_runner.run(path)
+            assert result.status == "FAIL"
+            messages = [m for _, m in result.validation_lines]
+            assert any("field not found in output" in m for m in messages), messages
+            print("[PASS] numeric_validation_field_not_found_and_bad_value")
+        finally:
+            test_runner.close()
+
+
+def fio_numeric_output_combined_example():
+    """TC017: real fio (write) -> lsblk -> real fio (read), each fio's
+    JSON output parsed into simple field lines and validated numerically."""
+    test_runner = TestRunner(config=ConfigManager())
+    try:
+        result = test_runner.run("tests/TC017_fio_numeric_output.nvtest")
+        assert result.status == "PASS", f"expected PASS, got {result.status}: {result.validation_lines}"
+        print(f"[PASS] fio_numeric_output_combined_example -> {result.log_path}")
+    finally:
+        test_runner.close()
+        for f in ("/tmp/nvme_test_numeric_fio.bin",):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 def main():
     print("Running Phase 1 smoke verification...\n")
     smoke_success()
@@ -819,6 +918,13 @@ def main():
     expect_regex_matches_stdout_and_stderr()
     expect_regex_rejects_invalid_pattern_at_parse_time()
     print("\nAll CAPTURE/EXPECT_REGEX checks passed.")
+
+    print("\nRunning numeric-comparison validation checks...\n")
+    numeric_validation_all_operators()
+    numeric_validation_supports_variable_substitution()
+    numeric_validation_field_not_found_and_bad_value()
+    fio_numeric_output_combined_example()
+    print("\nAll numeric-comparison checks passed.")
 
 
 if __name__ == "__main__":
