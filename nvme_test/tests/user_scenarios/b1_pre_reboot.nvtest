@@ -1,0 +1,21 @@
+# Scenario (b) PHASE 1 - run BEFORE the reboot. The reboot itself is done by the wrapper
+# (run_reboot_test.sh), NOT inside the .nvtest, because a reboot kills the framework process.
+TEST "Reboot persistence - PRE: set feature, verify, save value to disk"
+
+# 1. set (-s = save, so it is a candidate to survive reboot)
+RUN "nvme set-feature {{device0}} -f {{feature_id}} -v {{set_value}} -s"
+EXPECT_EXIT 0
+
+# 2. verify with get-feature
+RUN "nvme get-feature {{device0}} -f {{feature_id}}"
+EXPECT_EXIT 0
+EXPECT "Current value" CONTAINS "{{set_value_hex}}"
+
+# remember the value token (e.g. 0x000000). CAPTURE is RAM-only -> persist to disk for phase 2
+RUN "nvme get-feature {{device0}} -f {{feature_id}} | awk -F: '/Current value/{print $NF}'" CAPTURE pre_value
+EXPECT_EXIT 0
+RUN "echo '{{pre_value}}' > {{state_file}} && echo stored_value {{pre_value}}"
+EXPECT_EXIT 0
+EXPECT "stored_value" NOT_EMPTY
+
+END

@@ -1,0 +1,27 @@
+# Scenario (a): IO speed must DROP after feature value 0 -> 1
+# NOTE: edit the fio line for your real workload. tools/fio_metrics.py can return ANY fio field (see e_io_all_fields.nvtest)
+TEST "IO speed drops after set-feature value 0 -> 1"
+
+# 1. set feature (value 0, saved)
+RUN "nvme set-feature {{device0}} -f {{feature_id}} -v 0 -s"
+EXPECT_EXIT 0
+
+# 2. run IO, store speed (stdout is just the number -> CAPTURE keeps it clean)
+RUN "fio --name=perf --filename={{fio_target}} --rw=randread --bs=4k --direct=1 --runtime=10 --time_based --output-format=json | python3 tools/fio_metrics.py --metric total_iops" CAPTURE iops_before
+EXPECT_EXIT 0
+
+# 3. set feature (value 1, saved)
+RUN "nvme set-feature {{device0}} -f {{feature_id}} -v 1 -s"
+EXPECT_EXIT 0
+
+# 4. run IO, store speed
+RUN "fio --name=perf --filename={{fio_target}} --rw=randread --bs=4k --direct=1 --runtime=10 --time_based --output-format=json | python3 tools/fio_metrics.py --metric total_iops" CAPTURE iops_after
+EXPECT_EXIT 0
+
+# 5. compare: step-4 speed must be LESS than step-2 speed.
+#    echo makes a "field number" line so the native numeric EXPECT can compare against {{iops_before}}
+RUN "echo iops_after {{iops_after}}"
+EXPECT_EXIT 0
+EXPECT "iops_after" LT {{iops_before}}
+
+END

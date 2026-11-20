@@ -1,0 +1,19 @@
+# Common fio helper: tools/fio_metrics.py prints EVERY fio field as "name value" lines, so any
+# IO scenario can validate any field with the native numeric EXPECT. Run `... | python3 tools/fio_metrics.py --list`
+# once to see all names for your fio version. Latencies are in ns. Use the FULL field name.
+TEST "Mixed 70/30 randrw - validate throughput, latency tail, errors"
+
+RUN "fio --name=mixed --filename={{fio_target}} --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --direct=1 --runtime=10 --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "read_iops"         GE {{min_read_iops}}
+EXPECT "write_iops"        GT 0
+EXPECT "total_bw"          GT 0
+EXPECT "read_clat_ns_p99"  LT {{max_read_p99_ns}}
+EXPECT "read_lat_ns_mean"  LT {{max_read_p99_ns}}
+EXPECT "error"             EQ 0
+
+# a single field as a variable, e.g. to compare against a later run
+RUN "fio --name=mixed --filename={{fio_target}} --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --direct=1 --runtime=10 --time_based --output-format=json | python3 tools/fio_metrics.py --metric read_clat_ns_p99" CAPTURE p99_first
+EXPECT_EXIT 0
+
+END

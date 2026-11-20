@@ -1,0 +1,71 @@
+# TC02 - Write + Read + Set Feature + Get Feature + SMART + Read + Write + SMART
+# Notes from the spec/nvme-cli (differences from the manual document):
+#  * nvme-cli --block-count is ZERO-BASED (7 = 8 blocks) and --data-size (bytes) is required: size = (7+1) * LBA size,
+#    so the LBA size is read from id-ns instead of being hard-coded.
+#  * SMART data units are 512000-byte units and may lag, so counters are checked with a delta against a baseline snapshot.
+# Patterns: deterministic data files + cmp (data integrity), `save` / `delta-from` (counter deltas).
+TEST "TC02 Write + Read + Set/Get Feature + SMART + Read + Write + SMART"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns --metric lba_bytes --bare" CAPTURE lba_bytes
+EXPECT_EXIT 0
+RUN "echo $(( ({{io_block_count0}} + 1) * {{lba_bytes}} ))" CAPTURE data_bytes
+EXPECT_EXIT 0
+RUN "python3 tools/nvme_util.py pattern {{work_dir}}/write1.bin {{data_bytes}} 1"
+EXPECT_EXIT 0
+EXPECT "pattern_bytes" EQ {{data_bytes}}
+RUN "python3 tools/nvme_util.py pattern {{work_dir}}/write2.bin {{data_bytes}} 2"
+EXPECT_EXIT 0
+EXPECT "pattern_bytes" EQ {{data_bytes}}
+
+# baseline SMART snapshot
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py save {{work_dir}}/smart_tc02.json"
+EXPECT_EXIT 0
+
+# 1-2. write a known pattern, read back, compare
+RUN "tools/guard.sh {{allow_destructive}} nvme write {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/write1.bin"
+EXPECT_EXIT 0
+RUN "nvme read {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/read1.bin"
+EXPECT_EXIT 0
+RUN "cmp {{work_dir}}/write1.bin {{work_dir}}/read1.bin"
+EXPECT_EXIT 0
+
+# 3-4. set a feature, verify with get-feature
+RUN "nvme set-feature {{ctrl}} -f {{pm_fid}} -v {{pm_new_value}}"
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f {{pm_fid}} | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{pm_new_value}}
+
+# 5. SMART accessible, healthy
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc02.json"
+EXPECT_EXIT 0
+EXPECT "critical_warning" EQ 0
+EXPECT "media_errors" EQ 0
+
+# 6. another read: data must be unchanged
+RUN "nvme read {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/read2.bin"
+EXPECT_EXIT 0
+RUN "cmp {{work_dir}}/write1.bin {{work_dir}}/read2.bin"
+EXPECT_EXIT 0
+
+# 7. write a different pattern
+RUN "tools/guard.sh {{allow_destructive}} nvme write {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/write2.bin"
+EXPECT_EXIT 0
+
+# 8. SMART again: counters moved by at least what we issued, no media errors
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc02.json"
+EXPECT_EXIT 0
+EXPECT "d_host_write_commands" GE 2
+EXPECT "d_host_read_commands" GE 2
+EXPECT "media_errors" EQ 0
+EXPECT "critical_warning" EQ 0
+
+# (added check) the second pattern really landed
+RUN "nvme read {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/read3.bin"
+EXPECT_EXIT 0
+RUN "cmp {{work_dir}}/write2.bin {{work_dir}}/read3.bin"
+EXPECT_EXIT 0
+
+END

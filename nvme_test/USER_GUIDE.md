@@ -25,6 +25,8 @@ config/config.yaml             # config template (must be passed via --config to
 framework/                     # implementation — not normally edited
 tests/                          # your .nvtest files
 tests/examples/                 # realistic NVMe/FIO/passthru examples
+tests/user_scenarios/            # IO speed, reboot persistence, hex/string validation, FW commit examples
+tools/                          # helper scripts used inside RUN lines (fio_metrics.py)
 logs/                            # created at runtime, one logs/{run_id}/ per invocation
 ```
 
@@ -150,21 +152,60 @@ See `tests/TC011_parallel_stress.nvtest` (mock) /
 
 FIO → command → FIO with numeric output validation (real fio, safe — targets a `/tmp` file).
 fio's output isn't `field: number`-shaped by default, so `--output-format=json` is piped
-through a small inline Python snippet that prints simple `field value` lines — no fio-specific
-parsing exists in the framework; any command reducible to `field value` lines works the same:
+through the common helper `tools/fio_metrics.py` (§7.1), which prints simple `field value` lines —
+no fio-specific parsing exists in the framework; any command reducible to `field value` lines works the same:
 ```text
-RUN "fio --name=w --filename=/tmp/f.bin --size=4M --rw=write --bs=4k --output-format=json | python3 -c 'import json,sys; d=json.load(sys.stdin)[\"jobs\"][0]; print(\"write_iops\", d[\"write\"][\"iops\"])'"
+RUN "fio --name=w --filename=/tmp/f.bin --size=4M --rw=write --bs=4k --output-format=json | python3 tools/fio_metrics.py --metric write_iops --metric write_bw"
 EXPECT_EXIT 0
 EXPECT "write_iops" GE 1
+EXPECT "write_bw" GT 0
 
 RUN "lsblk"
 EXPECT_EXIT 0
 
-RUN "fio ... --rw=read ..."   # same JSON-pipe pattern
+RUN "fio ... --rw=read ..."   # same pipe pattern
 EXPECT_EXIT 0
 EXPECT "read_iops" GE 1
 ```
 See `tests/TC017_fio_numeric_output.nvtest`.
+
+### 7.1 `tools/fio_metrics.py` — common fio helper
+
+Turns fio's JSON into `field value` lines. **Every numeric field fio reports is exposed** (nothing is
+hard-coded), so any IO scenario can validate any field. Paths are relative: run `run.py` from the `nvme_test/` directory.
+
+```text
+RUN "fio --name=m --filename={{fio_target}} --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --direct=1 --runtime=10 --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "read_iops"        GE {{min_read_iops}}
+EXPECT "read_clat_ns_p99" LT {{max_read_p99_ns}}
+EXPECT "error"            EQ 0
+```
+
+| Usage | Result |
+|---|---|
+| `fio_metrics.py` | all fields, one `name value` per line |
+| `fio_metrics.py --list` | field names only (run once to see the names for your fio version) |
+| `--metric read_iops` | **only the number** — for `RUN ... CAPTURE var` |
+| `--metric a --metric b` | `name value` lines for just those fields |
+| `--job NAME\|N\|all` | choose a job (default `0`); `all` prefixes each name with its job name |
+| `--skip-idle` | hide directions that did no IO (e.g. `write_*` of a read-only job) |
+| `--int` | truncate values to integers |
+
+Field names are `<direction>_<fio key path>`: `read_iops`, `read_bw` (KiB/s), `read_bw_bytes`, `read_io_bytes`,
+`read_total_ios`, `read_lat_ns_mean`, `read_clat_ns_max`, `read_clat_ns_p99`, `read_clat_ns_p99_9`,
+`read_iops_min/max/mean/stddev`, `read_bw_min/max/mean/dev` (same for `write_`, `trim_`), plus `total_iops`,
+`total_bw`, `total_bw_bytes`, `total_io_bytes`, `total_ios` (read+write+trim) and job-level `error`, `usr_cpu`, `sys_cpu`, `ctx`.
+
+Notes:
+- Use the **full** field name in `EXPECT` (the framework matches a field as a substring on the first line containing it;
+  the helper prints shorter names first, so `read_bw` never returns `read_bw_bytes`).
+- Latencies are nanoseconds. Values never use exponent notation (the framework's number parser cannot read `1e-05`).
+- With `numjobs` above 1 add `--group_reporting` to fio so one aggregated job is reported.
+- Compare two runs: `CAPTURE` one value with `--metric`, then `RUN "echo iops_after {{iops_after}}"` and
+  `EXPECT "iops_after" LT {{iops_before}}` (see `tests/user_scenarios/a_io_speed_drop.nvtest`).
+- If fio fails there is no JSON: the helper exits `2` with a message on stderr, so `EXPECT_EXIT 0` catches it.
+- `tools/fio_iops.py` is kept for older tests (prints total IOPS as an integer); prefer `fio_metrics.py --metric total_iops`.
 
 ## 8. Validation Reference
 
@@ -269,6 +310,7 @@ applicable), `ITERATIONS RUN:`, `EXIT CODE (last iteration):`, `OUTPUT (last ite
 | `invalid regex ...` | bad `re` pattern | fix syntax (Python regex, not shell glob) |
 | `EXPECT_BYTE ... offset beyond N captured bytes` | output shorter than expected | check `BINARY OUTPUT: Size:` |
 | `expected a number for EXPECT ... GE, got '...'` | non-numeric literal after a numeric operator | use a plain number or `{{var}}` |
+| Test with `RUN "reboot"` leaves no `.log` and no result | the host reboot killed the framework process; the `.log` is only written when a test finishes | split into pre/post-reboot files (§15) |
 
 ## 14. Best Practices
 
@@ -279,3 +321,102 @@ applicable), `ITERATIONS RUN:`, `EXIT CODE (last iteration):`, `OUTPUT (last ite
 - Never rely on directory auto-discovery to run a destructive/hardware-required test — invoke
   it by exact path.
 - Two `RUN`s in the same `PARALLEL` block should not `CAPTURE` into the same variable name (race).
+
+## 15. Reboot / Power-Cycle Tests
+
+**A host reboot cannot be a `RUN` inside a test.** `RUN "reboot"` takes the framework process down
+with the machine, and:
+
+- the `.log` is written once, when the test *finishes* — a test that reboots mid-way produces **no log and no result**;
+- `CAPTURE` variables live in RAM — they are **lost** at reboot;
+- validations that ran before the reboot are lost with the log.
+
+**Pattern: two `.nvtest` files, reboot between them, state carried on disk.**
+
+| Part | What it does |
+|---|---|
+| Phase 1 file (`b1_pre_reboot.nvtest`) | set the feature (`-s` = save), verify with get-feature, write the value to a state file |
+| Wrapper (`run_reboot_test.sh`) | runs phase 1; if it passed, installs a one-shot service that runs phase 2 after boot; reboots |
+| Phase 2 file (`b2_post_reboot.nvtest`) | reads the state file, runs get-feature, compares with the pre-reboot value |
+
+Phase 1 (ends *before* the reboot — the wrapper does the reboot, not the test):
+```text
+TEST "Reboot persistence - PRE"
+RUN "nvme set-feature {{device0}} -f {{feature_id}} -v {{set_value}} -s"
+EXPECT_EXIT 0
+RUN "nvme get-feature {{device0}} -f {{feature_id}}"
+EXPECT "Current value" CONTAINS "{{set_value_hex}}"
+RUN "nvme get-feature {{device0}} -f {{feature_id}} | awk -F: '/Current value/{print $NF}'" CAPTURE pre_value
+RUN "echo '{{pre_value}}' > {{state_file}}"
+EXPECT_EXIT 0
+END
+```
+Phase 2 (after boot):
+```text
+TEST "Reboot persistence - POST"
+RUN "cat {{state_file}}" CAPTURE pre_value
+EXPECT_EXIT 0
+RUN "nvme get-feature {{device0}} -f {{feature_id}}"
+EXPECT "Current value" CONTAINS "{{pre_value}}"
+RUN "nvme get-feature {{device0}} -f {{feature_id}} -s 2"      # the SAVED copy (select=2)
+EXPECT "Current value" CONTAINS "{{pre_value}}"
+END
+```
+
+Rules:
+1. Never put the reboot in a `.nvtest`. End phase 1 before it; the wrapper reboots.
+2. Anything phase 2 needs must be on disk. Define the path as a variable (`state_file` in the variables JSON), write with
+   `echo '{{var}}' > {{state_file}}`, read back with `RUN "cat {{state_file}}" CAPTURE var`. Pick a path that survives
+   reboot (`/var/tmp`, not `/tmp`).
+3. Phase 1 and phase 2 are separate invocations: separate `logs/{run_id}/` directories and separate PASS/FAIL results.
+   After boot the phase 2 result is in `logs/<run_id>/b2_post_reboot.log` and `journalctl -u nvme-post-reboot`.
+4. If phase 1 fails, the wrapper stops before rebooting and installs nothing. The post-reboot service disables itself before it runs
+   (`ExecStartPre`), so it runs once even if phase 2 fails.
+5. After a reboot the controller may take a while to enumerate. The service waits up to ~120 s for `{{device0}}` to appear.
+6. Compare with `CONTAINS "{{pre_value}}"` rather than parsing numbers: the exact get-feature text depends on your
+   nvme-cli version (check `nvme get-feature -h`; `-s` is *save* for set-feature but *select* for get-feature).
+
+Run it (root + systemd needed; run from any directory):
+```bash
+sudo ./tests/user_scenarios/run_reboot_test.sh              # phase 1 -> reboot -> phase 2 after boot
+DRY_RUN=1 ./tests/user_scenarios/run_reboot_test.sh         # runs phase 1, writes the unit to /tmp, no systemctl, no reboot
+sudo ./tests/user_scenarios/run_reboot_test.sh cleanup      # remove the systemd unit and the state file (see below)
+```
+
+### Cleanup
+
+The wrapper changes systemd and leaves a state file. Both have a cleanup path:
+
+| What changed | Created by | Cleaned by |
+|---|---|---|
+| unit file `/etc/systemd/system/nvme-post-reboot.service` + `daemon-reload` | wrapper, after phase 1 passes | next wrapper run (stale leftovers), automatically if the wrapper fails / is interrupted / `reboot` fails, or `cleanup` |
+| enable symlink (`multi-user.target.wants`) | `systemctl enable` | the service disables itself when phase 2 starts; also `cleanup` |
+| `failed` state of the unit | a failed phase 2 | `systemctl reset-failed` (same places as the unit file) |
+| state file (`state_file`, e.g. in `/var/tmp`) | phase 1 | `cleanup` |
+
+Notes:
+- Run `cleanup` after you have looked at the phase 2 result: it deletes the state file that phase 2 compared against.
+- `logs/` and the **journal** are never touched: `journalctl -u nvme-post-reboot` only *reads* the journal; do not vacuum it.
+- **Changes a test makes to the drive stay with the test.** A command such as `set-feature ... -s` changes the drive
+  (`-s` = saved across reboot) and neither the wrapper nor `cleanup` reverts it. If a test must leave the drive as it
+  found it, put the restore in that `.nvtest`.
+- The wrapper clears its failure trap just before `reboot`, because systemd's shutdown sends SIGTERM to it and that
+  would delete the unit needed after boot.
+
+**When no split is needed:** if only the *device* is power-cycled or reset (Quarch, `nvme reset`, subsystem reset) and the
+host stays up, the framework process survives — keep it in one file: `RUN` the power-cycle/reset command, `RUN "sleep N"`,
+then continue with the verification `RUN`s. Only a **host** reboot needs the two-phase pattern.
+
+## 16. NVMe Test-Case Suite and Helper Tools
+
+`tests/nvme_suite/` automates TC01–TC10 (+TC12, TC14) of the NVMe test-case document and doubles as a template library — see
+`tests/nvme_suite/README.md` for the pattern catalog and the framework rules it relies on. Helpers in `tools/`:
+
+| Tool | Purpose |
+|---|---|
+| `fio_metrics.py` | fio JSON → `field value` lines (§7.1) |
+| `nvme_util.py` | nvme-cli JSON/text → `field value` lines; SMART snapshots + deltas; id-ns/list-ns/feature/fw-log/sanitize decoders; deterministic data patterns |
+| `wait_until.sh` | `wait_until.sh TIMEOUT INTERVAL 'cmd'` — poll until `cmd` succeeds (controller back after reset, sanitize done, ...) |
+| `guard.sh` | `guard.sh <yes\|no> cmd...` — runs destructive commands only when `allow_destructive=yes` (the framework has no skip statement) |
+
+Two framework facts worth remembering: every `RUN` executes even after a failure, and `{{var}}` is **not** substituted in the field name of an `EXPECT`.

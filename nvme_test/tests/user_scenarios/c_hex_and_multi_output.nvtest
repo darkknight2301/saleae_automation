@@ -1,0 +1,15 @@
+# Scenario (c): comparing GT/LT on values that arrive as strings (hex, multi-line)
+TEST "Hex string output compared numerically"
+
+RUN "nvme set-feature {{device0}} -f {{feature_id}} -v 10 -s"
+EXPECT_EXIT 0
+
+# Raw output: "...Current value:0x00000a". Framework's numeric regex only knows DECIMAL,
+# so GT on this raw text would read "0" (from "0x..."). Normalise to "field decimal" first:
+RUN "echo cur_value $(printf '%d' $(nvme get-feature {{device0}} -f {{feature_id}} | awk -F: '/Current value/{print $NF}'))"
+EXPECT_EXIT 0
+EXPECT "cur_value" GT 5
+EXPECT "cur_value" LE 10
+EXPECT "cur_value" EQ 10
+
+END

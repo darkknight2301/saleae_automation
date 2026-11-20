@@ -1,0 +1,63 @@
+# TC05 - Multiple Set/Get Feature Validation
+# Pattern: one CAPTURE per feature ("before"), set -> read back -> compare configured vs returned, prove untouched features
+# did not move, prove an INVALID value is rejected (exit status + NVMe status text on stderr), then restore and re-verify.
+# Rejection check pattern: `cmd; echo exit_status $?` keeps the RUN's own exit 0 so the non-zero status can be asserted.
+TEST "TC05 Multiple Set/Get Feature Validation"
+
+# 1. read current values of every feature in scope (supported features must return a value)
+RUN "nvme get-feature {{ctrl}} -f 0x01 | python3 tools/nvme_util.py feature-value --bare" CAPTURE b01
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f 0x02 | python3 tools/nvme_util.py feature-value --bare" CAPTURE b02
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f 0x04 | python3 tools/nvme_util.py feature-value --bare" CAPTURE b04
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f 0x07 | python3 tools/nvme_util.py feature-value --bare" CAPTURE b07
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f 0x08 | python3 tools/nvme_util.py feature-value --bare" CAPTURE b08
+EXPECT_EXIT 0
+
+# 2. set valid values (Arbitration, Power Management): must be accepted
+RUN "nvme set-feature {{ctrl}} -f 0x01 -v {{arb_new_value}}"
+EXPECT_EXIT 0
+RUN "nvme set-feature {{ctrl}} -f 0x02 -v {{pm_new_value}}"
+EXPECT_EXIT 0
+
+# 3-4. read back every feature: configured == returned; features we did not touch are unchanged
+RUN "nvme get-feature {{ctrl}} -f 0x01 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{arb_new_value}}
+RUN "nvme get-feature {{ctrl}} -f 0x02 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{pm_new_value}}
+RUN "nvme get-feature {{ctrl}} -f 0x04 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{b04}}
+RUN "nvme get-feature {{ctrl}} -f 0x07 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{b07}}
+RUN "nvme get-feature {{ctrl}} -f 0x08 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{b08}}
+
+# unsupported configuration: invalid power state must be rejected with an NVMe status, and must not change the value
+RUN "nvme set-feature {{ctrl}} -f 0x02 -v {{pm_invalid_value}}; echo exit_status $?"
+EXPECT_EXIT 0
+EXPECT "exit_status" NEQ 0
+EXPECT_STDERR "NVMe status" CONTAINS "Invalid Field"
+RUN "nvme get-feature {{ctrl}} -f 0x02 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{pm_new_value}}
+
+# 5. restore the original settings (part of the documented procedure) and verify
+RUN "nvme set-feature {{ctrl}} -f 0x01 -v {{b01}}"
+EXPECT_EXIT 0
+RUN "nvme set-feature {{ctrl}} -f 0x02 -v {{b02}}"
+EXPECT_EXIT 0
+RUN "nvme get-feature {{ctrl}} -f 0x01 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{b01}}
+RUN "nvme get-feature {{ctrl}} -f 0x02 | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{b02}}
+
+END

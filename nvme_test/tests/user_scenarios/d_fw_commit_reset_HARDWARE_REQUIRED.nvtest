@@ -1,0 +1,27 @@
+# DESTRUCTIVE / HARDWARE REQUIRED - never run via directory auto-discovery; invoke by exact path.
+# Firmware download + commit (activate on reset) + controller reset + verify new FW revision.
+# Needs variables: fw_image, fw_slot, expected_fw_new   (add to variables.json)
+TEST "FW download, commit, controller reset, verify revision"
+
+RUN "nvme id-ctrl {{device0}} | grep -w fr" CAPTURE fw_before
+EXPECT_EXIT 0
+
+RUN "nvme fw-download {{device0}} --fw={{fw_image}}"
+EXPECT_EXIT 0
+
+# commit action 1 = replace image in slot and activate at next reset
+RUN "nvme fw-commit {{device0}} --slot={{fw_slot}} --action=1"
+EXPECT_EXIT 0
+
+RUN "nvme fw-log {{device0}}"
+EXPECT_EXIT 0
+EXPECT "frs{{fw_slot}}" CONTAINS "{{expected_fw_new}}"
+
+RUN "nvme reset {{device0}}"
+EXPECT_EXIT 0
+
+RUN "sleep 5; nvme id-ctrl {{device0}}"
+EXPECT_EXIT 0
+EXPECT "fr " CONTAINS "{{expected_fw_new}}"
+
+END

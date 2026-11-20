@@ -1,0 +1,42 @@
+# TC07 - SMART Log Validation Before and After Stress Workload   (DESTRUCTIVE: raw random write)
+# Pattern: baseline snapshot -> workload -> `delta-from` ; error-log entry count compared in-shell.
+# SMART JSON temperature is in KELVIN (max_temp_k). "No unexpected errors" = media_errors delta 0 and
+# error-log entries not growing beyond max_new_error_entries (some controllers log benign entries - tune the variable).
+TEST "TC07 SMART and Error Log Validation Around Stress Workload"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+
+# 1-2. initial SMART + error log
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py save {{work_dir}}/smart_tc07.json"
+EXPECT_EXIT 0
+RUN "nvme error-log {{ctrl}} -e 64 -o json | python3 tools/nvme_util.py errlog-entries --bare" CAPTURE err_before
+EXPECT_EXIT 0
+
+# 3. sustained random write, 4. sustained random read
+RUN "tools/guard.sh {{allow_destructive}} fio --name=stress_write --filename={{ns}} --rw=randwrite --bs=4k --iodepth=32 --direct=1 --ioengine=libaio --runtime={{fio_stress_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "write_iops" GE {{min_stress_iops}}
+EXPECT "error" EQ 0
+RUN "fio --name=stress_read --filename={{ns}} --rw=randread --bs=4k --iodepth=32 --direct=1 --ioengine=libaio --runtime={{fio_stress_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "read_iops" GE {{min_stress_iops}}
+EXPECT "error" EQ 0
+
+# 5-7. SMART + error log again, compare counters
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc07.json"
+EXPECT_EXIT 0
+EXPECT "d_data_units_written" GT 0
+EXPECT "d_data_units_read" GT 0
+EXPECT "d_host_write_commands" GT 0
+EXPECT "d_host_read_commands" GT 0
+EXPECT "d_media_errors" EQ 0
+EXPECT "d_num_err_log_entries" LE {{max_new_error_entries}}
+EXPECT "critical_warning" EQ 0
+EXPECT "temperature" LT {{max_temp_k}}
+RUN "nvme error-log {{ctrl}} -e 64 -o json | python3 tools/nvme_util.py errlog-entries --bare" CAPTURE err_after
+EXPECT_EXIT 0
+RUN "echo new_error_log_entries $(( {{err_after}} - {{err_before}} ))"
+EXPECT "new_error_log_entries" LE {{max_new_error_entries}}
+
+END

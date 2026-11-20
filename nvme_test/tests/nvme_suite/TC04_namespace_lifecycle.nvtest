@@ -1,0 +1,68 @@
+# TC04 - Namespace Create + Attach + Format + Detach + Delete   (DESTRUCTIVE; needs allow_destructive=yes)
+# Differences from the manual document, per the NVMe spec / nvme-cli:
+#  * Format NVM only works on an ATTACHED namespace (a detached one is "Invalid Namespace or Format", and /dev/nvme0nX no
+#    longer exists), so the order is create -> attach -> format -> detach -> delete, not detach -> format.
+#  * nsid and cntlid are obtained dynamically (create-ns output / id-ctrl), never hard-coded.
+#  * `nvme format` needs --force in non-interactive runs (otherwise it waits/aborts on its warning).
+# Patterns: capture an ID from command output with sed, `ns-present` to verify (list-ns text or JSON).
+# Note: the framework executes every RUN even after a failure; each destructive step is guarded and uses the captured nsid.
+TEST "TC04 Namespace Create + Attach + Format + Detach + Delete"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+
+# 1. identify: controller must support namespace management (OACS bit 3)
+RUN "nvme list"
+EXPECT_EXIT 0
+RUN "nvme id-ctrl {{ctrl}} -o json | python3 tools/nvme_util.py fields --metric cntlid --bare" CAPTURE cntlid
+EXPECT_EXIT 0
+RUN "nvme id-ctrl {{ctrl}} -o json | python3 tools/nvme_util.py fields --metric oacs --bare" CAPTURE oacs
+EXPECT_EXIT 0
+RUN "echo ns_mgmt_supported $(( ({{oacs}} >> 3) & 1 ))"
+EXPECT "ns_mgmt_supported" EQ 1
+
+# 2. create a namespace; capture the NSID the controller assigned
+RUN "tools/guard.sh {{allow_destructive}} nvme create-ns {{ctrl}} --nsze={{ns_new_blocks}} --ncap={{ns_new_blocks}} --flbas=0" CAPTURE create_out
+EXPECT_EXIT 0
+EXPECT "created nsid" CONTAINS "Success"
+RUN "echo '{{create_out}}' | sed -n 's/.*nsid:\([0-9][0-9]*\).*/\1/p'" CAPTURE nsid_new
+EXPECT_EXIT 0
+RUN "echo new_nsid {{nsid_new}}"
+EXPECT "new_nsid" GE 2
+
+# 3-4. attach, wait for the block device, verify it is attached
+RUN "tools/guard.sh {{allow_destructive}} nvme attach-ns {{ctrl}} -n {{nsid_new}} -c {{cntlid}}"
+EXPECT_EXIT 0
+RUN "tools/wait_until.sh 30 1 'nvme id-ns {{ns_prefix}}{{nsid_new}}'"
+EXPECT_EXIT 0
+RUN "nvme list-ns {{ctrl}} | python3 tools/nvme_util.py ns-present {{nsid_new}}"
+EXPECT_EXIT 0
+EXPECT "ns_present" EQ 1
+# {{var}} is NOT substituted in an EXPECT *field name* (only in commands, numeric operands and CONTAINS values), so the
+# node check is done in the command and reported under a fixed field name. `&&` => no output (=> FAIL) if `nvme list` fails.
+RUN "nvme list > {{work_dir}}/nvme_list.txt && echo node_listed $(grep -cE '{{ns_prefix}}{{nsid_new}}([^0-9]|$)' {{work_dir}}/nvme_list.txt)"
+EXPECT_EXIT 0
+EXPECT "node_listed" EQ 1
+
+# 5. format the (attached) namespace
+RUN "tools/guard.sh {{allow_destructive}} nvme format {{ns_prefix}}{{nsid_new}} -s 0 --force"
+EXPECT_EXIT 0
+
+# 6-7. detach, verify it is no longer attached
+RUN "tools/guard.sh {{allow_destructive}} nvme detach-ns {{ctrl}} -n {{nsid_new}} -c {{cntlid}}"
+EXPECT_EXIT 0
+RUN "nvme list-ns {{ctrl}} | python3 tools/nvme_util.py ns-present {{nsid_new}}"
+EXPECT_EXIT 0
+EXPECT "ns_present" EQ 0
+
+# 8-9. delete, verify it is gone (allocated list + device list)
+RUN "tools/guard.sh {{allow_destructive}} nvme delete-ns {{ctrl}} -n {{nsid_new}}"
+EXPECT_EXIT 0
+RUN "nvme list-ns {{ctrl}} -a | python3 tools/nvme_util.py ns-present {{nsid_new}}"
+EXPECT_EXIT 0
+EXPECT "ns_present" EQ 0
+RUN "nvme list > {{work_dir}}/nvme_list.txt && echo node_listed $(grep -cE '{{ns_prefix}}{{nsid_new}}([^0-9]|$)' {{work_dir}}/nvme_list.txt)"
+EXPECT_EXIT 0
+EXPECT "node_listed" EQ 0
+
+END

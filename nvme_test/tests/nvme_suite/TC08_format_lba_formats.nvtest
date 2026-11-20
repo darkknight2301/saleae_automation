@@ -1,0 +1,59 @@
+# TC08 - Namespace Format With Different LBA Formats   (DESTRUCTIVE; needs allow_destructive=yes)
+# Pattern: the "other" LBA format and an invalid format index are DISCOVERED from id-ns (nvme_util.py id-ns), not hard-coded;
+# the I/O check afterwards sizes its buffers from the NEW LBA size. A rejected command is asserted via `; echo exit_status $?`.
+# --force is required for non-interactive `nvme format`. Metadata-carrying formats are skipped when choosing the other format.
+TEST "TC08 Namespace Format With Different LBA Formats"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+
+# 1-2. identify namespace + supported formats
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns"
+EXPECT_EXIT 0
+EXPECT "lbaf_count" GE 2
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns --metric lbaf_other --bare" CAPTURE lbaf_other
+EXPECT_EXIT 0
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns --metric lbaf_invalid --bare" CAPTURE lbaf_invalid
+EXPECT_EXIT 0
+RUN "echo another_format_exists $(( {{lbaf_other}} >= 0 )) invalid_index_exists $(( {{lbaf_invalid}} >= 0 ))"
+EXPECT "another_format_exists" EQ 1
+EXPECT "invalid_index_exists" EQ 1
+
+# 3-4. format with LBA format 0, verify it is in use
+RUN "tools/guard.sh {{allow_destructive}} nvme format {{ns}} -l 0 --force"
+EXPECT_EXIT 0
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns"
+EXPECT_EXIT 0
+EXPECT "lbaf_in_use" EQ 0
+
+# 5-6. format with another supported format, verify it is the one reported
+RUN "tools/guard.sh {{allow_destructive}} nvme format {{ns}} -l {{lbaf_other}} --force"
+EXPECT_EXIT 0
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns"
+EXPECT_EXIT 0
+EXPECT "lbaf_in_use" EQ {{lbaf_other}}
+
+# 7. read/write after formatting, buffers sized from the new LBA size
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns --metric lba_bytes --bare" CAPTURE lba_bytes
+EXPECT_EXIT 0
+RUN "echo $(( ({{io_block_count0}} + 1) * {{lba_bytes}} ))" CAPTURE data_bytes
+EXPECT_EXIT 0
+RUN "python3 tools/nvme_util.py pattern {{work_dir}}/write1.bin {{data_bytes}} 8"
+EXPECT_EXIT 0
+RUN "tools/guard.sh {{allow_destructive}} nvme write {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/write1.bin"
+EXPECT_EXIT 0
+RUN "nvme read {{ns}} --start-block={{io_start_block}} --block-count={{io_block_count0}} --data-size={{data_bytes}} --data={{work_dir}}/read1.bin"
+EXPECT_EXIT 0
+RUN "cmp {{work_dir}}/write1.bin {{work_dir}}/read1.bin"
+EXPECT_EXIT 0
+
+# unsupported LBA format must be rejected, and must not change the format in use
+RUN "tools/guard.sh {{allow_destructive}} nvme format {{ns}} -l {{lbaf_invalid}} --force; echo exit_status $?"
+EXPECT_EXIT 0
+EXPECT "exit_status" NEQ 0
+EXPECT_STDERR "NVMe status" CONTAINS "Invalid Format"
+RUN "nvme id-ns {{ns}} -o json | python3 tools/nvme_util.py id-ns"
+EXPECT_EXIT 0
+EXPECT "lbaf_in_use" EQ {{lbaf_other}}
+
+END

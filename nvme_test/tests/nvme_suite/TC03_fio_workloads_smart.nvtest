@@ -1,0 +1,55 @@
+# TC03 - FIO Workload + Get Log   (DESTRUCTIVE: raw-device writes -> needs allow_destructive=yes)
+# Pattern: fio JSON -> tools/fio_metrics.py (every fio field is a `name value` line) validated with numeric EXPECTs;
+# SMART snapshot after each phase (`delta-from --update` re-bases the baseline so each phase is judged on its own delta).
+# numjobs>1 needs --group_reporting so fio reports ONE aggregated job.
+TEST "TC03 FIO Workload + SMART Log"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+
+# 1. initial SMART log
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py save {{work_dir}}/smart_tc03.json"
+EXPECT_EXIT 0
+
+# 2-3. sequential write, then SMART
+RUN "tools/guard.sh {{allow_destructive}} fio --name=seq_write --filename={{ns}} --rw=write --bs=128k --iodepth=32 --numjobs=1 --direct=1 --ioengine=libaio --runtime={{fio_seq_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "write_bw" GE {{min_seq_write_bw_kib}}
+EXPECT "write_clat_ns_p99" LT {{max_p99_ns}}
+EXPECT "error" EQ 0
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc03.json --update"
+EXPECT_EXIT 0
+EXPECT "d_data_units_written" GT 0
+EXPECT "d_host_write_commands" GT 0
+EXPECT "media_errors" EQ 0
+EXPECT "critical_warning" EQ 0
+
+# 4-5. sequential read, then SMART
+RUN "fio --name=seq_read --filename={{ns}} --rw=read --bs=128k --iodepth=32 --numjobs=1 --direct=1 --ioengine=libaio --runtime={{fio_seq_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "read_bw" GE {{min_seq_read_bw_kib}}
+EXPECT "read_clat_ns_p99" LT {{max_p99_ns}}
+EXPECT "error" EQ 0
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc03.json --update"
+EXPECT_EXIT 0
+EXPECT "d_data_units_read" GT 0
+EXPECT "d_host_read_commands" GT 0
+EXPECT "media_errors" EQ 0
+
+# 6-7. random 70/30 read/write, 4 jobs, then final SMART
+RUN "tools/guard.sh {{allow_destructive}} fio --name=rand_rw --filename={{ns}} --rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --numjobs=4 --group_reporting --direct=1 --ioengine=libaio --runtime={{fio_rand_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py"
+EXPECT_EXIT 0
+EXPECT "total_iops" GE {{min_randrw_total_iops}}
+EXPECT "read_iops" GT 0
+EXPECT "write_iops" GT 0
+EXPECT "read_clat_ns_p99" LT {{max_p99_ns}}
+EXPECT "write_clat_ns_p99" LT {{max_p99_ns}}
+EXPECT "error" EQ 0
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc03.json --update"
+EXPECT_EXIT 0
+EXPECT "d_data_units_written" GT 0
+EXPECT "d_data_units_read" GT 0
+EXPECT "media_errors" EQ 0
+EXPECT "critical_warning" EQ 0
+
+END

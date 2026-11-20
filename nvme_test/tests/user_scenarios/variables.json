@@ -1,0 +1,10 @@
+{
+  "device0": "/dev/nvme0",
+  "fio_target": "/dev/nvme0n1",
+  "feature_id": "0x02",
+  "state_file": "/var/tmp/nvme_before_reboot.txt",
+  "set_value": "0",
+  "set_value_hex": "0x000000",
+  "min_read_iops": 50000,
+  "max_read_p99_ns": 500000
+}

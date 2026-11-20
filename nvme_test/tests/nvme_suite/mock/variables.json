@@ -1,0 +1,45 @@
+{
+  "ctrl": "/dev/nvme0",
+  "ns": "/dev/nvme0n1",
+  "ns_prefix": "/dev/nvme0n",
+  "work_dir": "/tmp/mock_suite/work",
+  "allow_destructive": "yes",
+
+  "pm_fid": "0x02",
+  "pm_new_value": "1",
+  "pm_invalid_value": "31",
+  "arb_new_value": "1",
+
+  "io_start_block": "0",
+  "io_block_count0": "7",
+
+  "reset_delay_s": "1",
+  "reset_wait_s": "30",
+
+  "fio_seq_runtime": "60",
+  "fio_rand_runtime": "120",
+  "fio_stress_runtime": "300",
+  "fio_short_runtime": "10",
+  "fio_region_bytes": "104857600",
+
+  "min_seq_write_bw_kib": "100000",
+  "min_seq_read_bw_kib": "100000",
+  "min_randrw_total_iops": "10000",
+  "min_stress_iops": "1000",
+  "min_qd64_iops": "50000",
+  "max_p99_ns": "20000000",
+  "max_temp_k": "358",
+  "max_new_error_entries": "0",
+
+  "ns_new_blocks": "100000",
+
+  "fw_image": "/tmp/mock_suite/work/firmware.bin",
+  "fw_slot": "1",
+  "fw_expected_rev": "FW_2.0",
+  "fw_activate_cmd": "nvme reset /dev/nvme0",
+  "fw_wait_s": "30",
+
+  "san_action": "2",
+  "san_timeout_s": "60",
+  "san_poll_s": "1"
+}

@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mocklib import *
+
+pos, o = parse(sys.argv[1:], ("time_based", "group_reporting", "direct"))
+o = {k.replace("-", "_"): v for k, v in o.items()}
+bs = o.get("bs", "4k"); bs_k = int(bs[:-1]) * (1024 if bs[-1] == "m" else 1) if bs[-1] in "km" else int(bs) // 1024
+qd, nj = int(o.get("iodepth", 1)), int(o.get("numjobs", 1))
+rt, rw, mix = int(o.get("runtime", 10)), o.get("rw", "read"), int(o.get("rwmixread", 50))
+dev = o.get("filename", "")
+with state() as st:
+    check_up(st); nsid = nsid_of(dev)
+    if nsid not in st["ns"] or not st["ns"][nsid]["att"]:
+        sys.stderr.write("fio: failed to open %s: No such file or directory\n" % dev); sys.exit(1)
+    epoch = st["reset_epoch"]
+end = time.time() + min(rt, float(os.environ.get("MOCK_FIO_SLEEP", 3)))
+while time.time() < end:
+    time.sleep(0.1)
+    with state() as st:
+        if st["reset_epoch"] != epoch:
+            sys.stderr.write("fio: io_u error on file %s: Input/output error\n" % dev); print("fio: terminating on signal"); sys.exit(5)
+iops = min(qd * nj * 12000, 3000000 // bs_k, 700000) * (0.001 if os.environ.get("MOCK_SLOW_IO") else 1) * (0.25 if os.environ.get("MOCK_QD_COLLAPSE") and qd >= 64 else 1)
+rf = 1.0 if "read" in rw and "rw" not in rw.replace("read", "") else (mix / 100.0 if rw in ("rw", "randrw", "readwrite") else 0.0)
+lat = int(qd * nj / max(iops, 1) * 1e9)
+
+
+def blk(i):
+    n = int(i * rt); L = lambda m: {"min": m // 4, "max": m * 40, "mean": m + 0.5, "stddev": m / 3.0, "N": n}
+    c = L(lat); c["percentile"] = {"1.000000": lat // 2, "50.000000": lat, "99.000000": lat * 3, "99.900000": lat * 6, "99.990000": lat * 9}
+    return {"io_bytes": n * bs_k * 1024, "io_kbytes": n * bs_k, "bw_bytes": int(i * bs_k * 1024), "bw": int(i * bs_k), "iops": float(i), "runtime": rt * 1000,
+            "total_ios": n, "short_ios": 0, "drop_ios": 0, "slat_ns": L(2000), "clat_ns": c, "lat_ns": L(lat + 2000),
+            "bw_min": 1, "bw_max": int(i * bs_k * 2), "bw_agg": 100.0, "bw_mean": float(i * bs_k), "bw_dev": 5.0, "bw_samples": 20,
+            "iops_min": 1, "iops_max": int(i * 1.2), "iops_mean": float(i), "iops_stddev": 3.0, "iops_samples": 20}
+
+
+idle = blk(0)
+r, w = (blk(iops * rf) if rf else idle), (blk(iops * (1 - rf)) if rf < 1 else idle)
+with state() as st:
+    s = st["sm"]; s["hrc"] += int(iops * rf * rt); s["hwc"] += int(iops * (1 - rf) * rt)
+    s["rd_bytes"] += int(iops * rf * rt * bs_k * 1024); s["wr_bytes"] += int(iops * (1 - rf) * rt * bs_k * 1024)
+    s["media"] += 1 if os.environ.get("MOCK_MEDIA_ERR") else 0
+job = {"jobname": o.get("name", "job"), "groupid": 0, "error": 0, "elapsed": rt, "job options": {"bs": bs}, "read": r, "write": w, "trim": idle,
+       "job_runtime": rt * 1000, "usr_cpu": 1.5, "sys_cpu": 5.25, "ctx": 1000, "majf": 0, "minf": 10, "iodepth_level": {"1": 0.1, ">=64": 99.5}}
+print("fio-3.35 (mock)")
+print(json.dumps({"fio version": "fio-3.35", "jobs": [job]}))

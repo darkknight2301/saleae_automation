@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mocklib import *
+
+FLAGS = {"set-feature": ("s", "save", "H"), "get-feature": ("H",), "list-ns": ("a", "all"), "format": ("force",)}
+BAD = "Invalid Field in Command: A reserved coded value or an unsupported value in a defined field"
+sub, rest = sys.argv[1], sys.argv[2:]
+pos, o = parse(rest, FLAGS.get(sub, ()))
+dev = pos[0] if pos else ""
+js = g(o, "o", "output-format") == "json"
+
+
+def kv(d, hexkeys=()):
+    for k, v in d.items():
+        print("%-14s: %s" % (k, hex(v) if k in hexkeys and isinstance(v, int) else v))
+
+
+def need_ns(st, nsid):
+    if nsid is None or nsid not in st["ns"] or not st["ns"][nsid]["att"]:
+        fail("Invalid Namespace or Format", 0xb)
+    return st["ns"][nsid]
+
+
+with state() as st:
+    if sub != "reset":
+        check_up(st)
+    if sub == "id-ctrl":
+        d = {"vid": 7519, "sn": "MOCK0001", "mn": "MockSSD", "fr": st["fr"], "mdts": 5, "cntlid": CNTLID, "ver": 66304, "oacs": 8,
+             "frmw": 20, "lpa": 14, "elpe": 63, "npss": 4, "sanicap": 6, "tnvmcap": TNVMCAP, "unvmcap": unalloc(st), "nn": 32}
+        print(json.dumps(d)) if js else kv(d, ("oacs", "frmw", "sanicap", "lpa", "ver"))
+    elif sub == "id-ns":
+        nsid = nsid_of(dev) or str(g(o, "n", "namespace-id", default=""))
+        ns = need_ns(st, nsid)
+        d = {"nsze": ns["nsze"], "ncap": ns["nsze"], "nuse": ns["nsze"], "nlbaf": len(LBAF) - 1, "flbas": ns["flbas"],
+             "lbafs": [{"ms": m, "ds": s, "rp": 0} for m, s in LBAF]}
+        if js:
+            print(json.dumps(d))
+        else:
+            kv({k: v for k, v in d.items() if k != "lbafs"})
+            for i, (m, s) in enumerate(LBAF):
+                print("lbaf %2d : ms:%-3d lbads:%-2d rp:0 %s" % (i, m, s, "(in use)" if i == ns["flbas"] & 15 else ""))
+    elif sub == "list":
+        print("Node             SN        Model    Namespace Usage                   Format      FW Rev")
+        for i, n in sorted(st["ns"].items()):
+            if n["att"]:
+                print("/dev/nvme0n%s  MOCK0001  MockSSD  %s         %d B  / %d B  %d B + 0 B  %s" % (i, i, n["nsze"] * lba_bytes(n), n["nsze"] * lba_bytes(n), lba_bytes(n), st["fr"]))
+    elif sub == "list-ns":
+        ids = sorted(int(i) for i, n in st["ns"].items() if n["att"] or g(o, "a", "all"))
+        print(json.dumps({"nsid_list": [{"nsid": i} for i in ids]})) if js else [print("[%4d]:0x%x" % (k, i)) for k, i in enumerate(ids)]
+    elif sub in ("get-feature", "set-feature"):
+        fid = int(g(o, "f", "feature-id", default="-1"), 0)
+        f = st["feat"].get(str(fid))
+        if f is None:
+            fail(BAD, 2)
+        name = FEATURES[fid]
+        if sub == "set-feature":
+            v = int(g(o, "v", "value", default="0"), 0)
+            if fid == 2 and v > 4:
+                fail(BAD, 2)
+            f["c"] = v
+            if g(o, "s", "save") and not os.environ.get("MOCK_NO_SAVE"):
+                f["s"] = v
+            print("set-feature:0x%02x (%s), value:0x%06x" % (fid, name, v))
+        else:
+            sel = int(g(o, "s", "sel", "select", default="0"))
+            lab, v = {0: ("Current", f["c"]), 1: ("Default", f["d"]), 2: ("Saved", f["s"] if f["s"] is not None else f["d"]), 3: ("Supported Capabilities", 5)}[sel]
+            print("get-feature:0x%02x (%s), %s value:0x%06x" % (fid, name, lab, v))
+    elif sub == "reset":
+        for f in st["feat"].values():
+            if not os.environ.get("MOCK_RESET_KEEPS_FEATURES"):
+                f["c"] = f["s"] if f["s"] is not None else f["d"]
+        if st["pending"] is not None and not os.environ.get("MOCK_FW_NOACT"):
+            st["active"], st["fr"], st["pending"] = st["pending"], st["slots"][str(st["pending"])], None
+        if os.environ.get("MOCK_RESET_LOSES_DATA"):
+            [os.remove(img(i)) for i in st["ns"] if os.path.exists(img(i))]
+        st["reset_epoch"] += 1
+        st["reset_until"] = time.time() + 1.0
+    elif sub == "smart-log":
+        d = smart(st)
+        print(json.dumps(d)) if js else kv(d)
+    elif sub == "error-log":
+        n = int(g(o, "e", "log-entries", default="64"))
+        print(json.dumps({"errors": [{"error_count": 0, "sqid": 0, "cmdid": 0, "status_field": 0, "lba": 0, "nsid": 0}] * n})) if js else print("Error Log Entries for device:nvme0 entries:%d" % n)
+    elif sub in ("write", "read"):
+        nsid = nsid_of(dev); ns = need_ns(st, nsid)
+        slba, nlb, size, path = int(g(o, "s", "start-block", default="0"), 0), int(g(o, "c", "block-count", default="0"), 0), g(o, "z", "data-size"), g(o, "d", "data")
+        lb = lba_bytes(ns)
+        if size is None or int(size, 0) != (nlb + 1) * lb:
+            sys.stderr.write("data-size must be given and equal (block-count+1)*lba_size = %d\n" % ((nlb + 1) * lb)); sys.exit(1)
+        if slba + nlb >= ns["nsze"]:
+            fail("LBA Out of Range", 0x80)
+        p = img(nsid)
+        if not os.path.exists(p):
+            open(p, "wb").close()
+        if sub == "write":
+            data = open(path, "rb").read()
+            with open(p, "r+b") as fh:
+                fh.seek(slba * lb); fh.write(data)
+            st["sm"]["hwc"] += 1; st["sm"]["wr_bytes"] += len(data)
+            print("write: Success")
+        else:
+            with open(p, "rb") as fh:
+                fh.seek(slba * lb); data = fh.read((nlb + 1) * lb)
+            data = data.ljust((nlb + 1) * lb, b"\0")
+            if os.environ.get("MOCK_CORRUPT_READ"):
+                data = bytes([data[0] ^ 0xFF]) + data[1:]
+            open(path, "wb").write(data)
+            st["sm"]["hrc"] += 1; st["sm"]["rd_bytes"] += len(data)
+            print("read: Success")
+    elif sub == "create-ns":
+        nsze = int(g(o, "s", "nsze", default="0"), 0); flbas = int(g(o, "f", "flbas", default="0"), 0)
+        if nsze == 0 or nsze * (1 << LBAF[flbas][1]) > unalloc(st):
+            fail("Namespace Insufficient Capacity", 0x115)
+        nsid = str(max(int(i) for i in st["ns"]) + 1)
+        st["ns"][nsid] = {"nsze": nsze, "flbas": flbas, "att": False}
+        print("create-ns: Success, created nsid:%s" % nsid)
+    elif sub in ("attach-ns", "detach-ns"):
+        nsid = str(g(o, "n", "namespace-id")); 
+        if nsid not in st["ns"]:
+            fail("Invalid Namespace or Format", 0xb)
+        if str(g(o, "c", "controllers")) != str(CNTLID):
+            fail("Controller List Invalid", 0x11c)
+        st["ns"][nsid]["att"] = sub == "attach-ns"
+        print("%s: Success, nsid:%s" % (sub, nsid))
+    elif sub == "delete-ns":
+        nsid = str(g(o, "n", "namespace-id"))
+        if nsid not in st["ns"] or nsid == "1":
+            fail("Invalid Namespace or Format", 0xb)
+        del st["ns"][nsid]
+        if os.path.exists(img(nsid)): os.remove(img(nsid))
+        print("delete-ns: Success, deleted nsid:%s" % nsid)
+    elif sub == "format":
+        nsid = nsid_of(dev) or str(g(o, "n", "namespace-id"))
+        ns = need_ns(st, nsid)
+        lbaf = int(g(o, "l", "lbaf", default="0"), 0)
+        if lbaf >= len(LBAF):
+            fail("Invalid Format: The LBA Format specified is not supported", 0x10a)
+        if not os.environ.get("MOCK_FORMAT_IGNORED"):
+            ns["flbas"] = lbaf
+        if os.path.exists(img(nsid)): os.remove(img(nsid))
+        print("Success formatting namespace:%s" % nsid)
+    elif sub == "fw-download":
+        p = g(o, "f", "fw")
+        if not p or not os.path.exists(p) or os.path.getsize(p) % 4:
+            sys.stderr.write("firmware image missing or size not a multiple of 4\n"); sys.exit(1)
+        st["fwbuf"] = open(p).read().strip()
+        print("Firmware download success")
+    elif sub == "fw-commit":
+        slot, act = int(g(o, "s", "slot", default="0")), int(g(o, "a", "action", default="0"))
+        if slot not in (1, 2) or act not in (0, 1, 2) or (act < 2 and not st["fwbuf"]):
+            fail(BAD, 2)
+        if act < 2:
+            st["slots"][str(slot)], st["fwbuf"] = st["fwbuf"], None
+        if act >= 1:
+            st["pending"] = slot
+        print("Success committing firmware action:%d slot:%d" % (act, slot))
+    elif sub == "fw-log":
+        afi = st["active"] | ((st["pending"] or 0) << 4)
+        print("Firmware Log for device:nvme0\nafi  : 0x%x" % afi)
+        for s, v in st["slots"].items():
+            print("frs%s : 0x%s" % (s, v.encode().hex()))
+    elif sub == "sanitize":
+        act = int(g(o, "a", "sanact", default="0"))
+        t = st["san"]
+        if act not in (2, 3, 4):
+            fail(BAD, 2)
+        if t["state"] == 2 and time.time() - t["t0"] < t["dur"]:
+            fail("Sanitize In Progress", 0x11d)
+        t.update(t0=time.time(), state=2)
+        [os.remove(img(i)) for i in st["ns"] if os.path.exists(img(i))]
+        print("Success sanitize")
+    elif sub == "sanitize-log":
+        t = st["san"]
+        done = time.time() - t["t0"] >= t["dur"]
+        if t["state"] == 2 and done:
+            t["state"] = 3 if os.environ.get("MOCK_SAN_FAIL") else 1
+        sstat = {0: 0, 1: 0x101, 2: 2, 3: 3}[t["state"]]
+        sprog = 65535 if t["state"] != 2 else int(65535 * (time.time() - t["t0"]) / t["dur"])
+        d = {"sprog": sprog, "sstat": sstat, "cdw10_info": 0, "time_over_write": 0, "time_block_erase": 3}
+        if js: print(json.dumps(d))
+        else: print("Sanitize Progress                    (SPROG) :  %d\nSanitize Status                      (SSTAT) :  0x%x" % (sprog, sstat))
+    else:
+        sys.stderr.write("mock nvme: unsupported subcommand %s\n" % sub); sys.exit(1)

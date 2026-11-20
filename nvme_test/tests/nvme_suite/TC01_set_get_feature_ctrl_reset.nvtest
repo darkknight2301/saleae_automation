@@ -1,0 +1,37 @@
+# TC01 - Set Feature + Get Feature + Controller Reset + Get Feature
+# Spec rule used as the oracle: a feature changed WITHOUT save (-s) is not persistent -> after a Controller Level
+# Reset it returns to its saved value (or default if nothing saved), i.e. to the value read in step 1.
+# Pattern: CAPTURE the "before" value, compare "after" against it with a numeric EXPECT ... EQ {{var}}.
+# nvme-cli get-feature -s: 0 current, 1 default, 2 saved, 3 capabilities.
+TEST "TC01 Set Feature + Get Feature + Controller Reset + Get Feature"
+
+# 1. read the current feature value (bare decimal captured; the pipe fails -> exit 2 if get-feature failed)
+RUN "nvme get-feature {{ctrl}} -f {{pm_fid}} | python3 tools/nvme_util.py feature-value --bare" CAPTURE v_before
+EXPECT_EXIT 0
+
+# the new value must differ from the current one, otherwise the test proves nothing
+RUN "echo precondition_new_differs $(( {{pm_new_value}} != {{v_before}} ))"
+EXPECT_EXIT 0
+EXPECT "precondition_new_differs" EQ 1
+
+# 2. set a new value (no -s: not saved)
+RUN "nvme set-feature {{ctrl}} -f {{pm_fid}} -v {{pm_new_value}}"
+EXPECT_EXIT 0
+
+# 3. verify with get-feature
+RUN "nvme get-feature {{ctrl}} -f {{pm_fid}} | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{pm_new_value}}
+
+# 4. controller reset, then wait until the controller answers again (no fixed sleeps)
+RUN "nvme reset {{ctrl}}"
+EXPECT_EXIT 0
+RUN "tools/wait_until.sh {{reset_wait_s}} 1 'nvme id-ctrl {{ctrl}}'"
+EXPECT_EXIT 0
+
+# 5/6. read again; persistence behaviour for an UNSAVED feature = back to the pre-test value
+RUN "nvme get-feature {{ctrl}} -f {{pm_fid}} | python3 tools/nvme_util.py feature-value"
+EXPECT_EXIT 0
+EXPECT "feature_value" EQ {{v_before}}
+
+END

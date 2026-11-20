@@ -1,0 +1,58 @@
+# TC10 - Sanitize + Sanitize Status + SMART Log   (DESTRUCTIVE: erases ALL data; needs allow_destructive=yes)
+# Pattern: long-running operation = start it, then poll with wait_until.sh (timeout + interval variables) instead of a fixed sleep.
+# SSTAT[2:0]: 0 never sanitized, 1 completed OK, 2 in progress, 3 failed, 4 completed OK with deallocation.  SPROG 65535 = 100%.
+# san_action 2 = block erase (SANICAP bit 1); other actions need their own SANICAP bit (overwrite 3 -> bit 2, crypto 4 -> bit 0).
+# What the drive returns when reading erased blocks is not defined for block erase, so data content is not asserted.
+TEST "TC10 Sanitize + Sanitize Status + SMART Log"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+
+# 1-2. baseline SMART/error log + capability check
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py save {{work_dir}}/smart_tc10.json"
+EXPECT_EXIT 0
+RUN "nvme error-log {{ctrl}} -e 64 -o json | python3 tools/nvme_util.py errlog-entries --bare" CAPTURE err_before
+EXPECT_EXIT 0
+RUN "nvme id-ctrl {{ctrl}} -o json | python3 tools/nvme_util.py fields --metric sanicap --bare" CAPTURE sanicap
+EXPECT_EXIT 0
+RUN "echo block_erase_supported $(( ({{sanicap}} >> 1) & 1 ))"
+EXPECT "block_erase_supported" EQ 1
+RUN "nvme sanitize-log {{ctrl}} -o json | python3 tools/nvme_util.py sanitize-state"
+EXPECT_EXIT 0
+EXPECT "san_in_progress" EQ 0
+
+# 3. start the sanitize operation
+RUN "tools/guard.sh {{allow_destructive}} nvme sanitize {{ctrl}} -a {{san_action}}"
+EXPECT_EXIT 0
+
+# 4. status must be a valid progress/complete state right after start
+RUN "nvme sanitize-log {{ctrl}} -o json | python3 tools/nvme_util.py sanitize-state --metric san_status --bare" CAPTURE san_state0
+EXPECT_EXIT 0
+RUN "echo san_state_valid $(( {{san_state0}} == 2 || {{san_state0}} == 1 || {{san_state0}} == 4 ))"
+EXPECT "san_state_valid" EQ 1
+
+# 5. wait for completion (poll sanitize-log)
+RUN "tools/wait_until.sh {{san_timeout_s}} {{san_poll_s}} 'nvme sanitize-log {{ctrl}} -o json | python3 tools/nvme_util.py sanitize-state --done'"
+EXPECT_EXIT 0
+
+# 6. final status: completed successfully, 100 %
+RUN "nvme sanitize-log {{ctrl}} -o json | python3 tools/nvme_util.py sanitize-state"
+EXPECT_EXIT 0
+EXPECT "san_in_progress" EQ 0
+EXPECT "san_progress" EQ 65535
+RUN "nvme sanitize-log {{ctrl}} -o json | python3 tools/nvme_util.py sanitize-state --metric san_status --bare" CAPTURE san_final
+EXPECT_EXIT 0
+RUN "echo san_completed_ok $(( {{san_final}} == 1 || {{san_final}} == 4 ))"
+EXPECT "san_completed_ok" EQ 1
+
+# 7. SMART + error log: healthy, nothing new
+RUN "nvme smart-log {{ctrl}} -o json | python3 tools/nvme_util.py delta-from {{work_dir}}/smart_tc10.json"
+EXPECT_EXIT 0
+EXPECT "critical_warning" EQ 0
+EXPECT "d_media_errors" EQ 0
+RUN "nvme error-log {{ctrl}} -e 64 -o json | python3 tools/nvme_util.py errlog-entries --bare" CAPTURE err_after
+EXPECT_EXIT 0
+RUN "echo new_error_log_entries $(( {{err_after}} - {{err_before}} ))"
+EXPECT "new_error_log_entries" LE {{max_new_error_entries}}
+
+END

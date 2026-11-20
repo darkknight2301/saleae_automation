@@ -1,0 +1,7 @@
+framework:
+  log_directory: logs
+  log_level: INFO
+execution:
+  command_timeout: 600
+variables:
+  file: tests/user_scenarios/variables.json

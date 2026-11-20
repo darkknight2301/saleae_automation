@@ -1,0 +1,48 @@
+# TC09 - Firmware Download + Commit + Controller Reset   (DESTRUCTIVE: replaces firmware; needs allow_destructive=yes)
+# Notes:  commit action 1 = "replace the image in the slot, activate at the next reset". Whether `nvme reset` (controller level)
+#         is enough or a power cycle / PCIe reset is needed is drive-specific -> the activation step is the variable
+#         fw_activate_cmd (e.g. a Quarch power-cycle script). Slot 1 can be read-only (id-ctrl FRMW bit 0) - checked first.
+#         fw-log's slot fields are hex-encoded text, so the AFI field (active/next slot) is used, and the revision comes from id-ctrl `fr`.
+# Pattern: preconditions as numeric EXPECTs, a hook variable for hardware-specific steps, string compare with CONTAINS "{{var}}".
+TEST "TC09 Firmware Download + Commit + Reset"
+
+# 1-2. identify, current firmware revision, preconditions
+RUN "nvme id-ctrl {{ctrl}} | python3 tools/nvme_util.py kv fr --bare" CAPTURE fr_before
+EXPECT_EXIT 0
+RUN "nvme id-ctrl {{ctrl}} -o json | python3 tools/nvme_util.py fields --metric frmw --bare" CAPTURE frmw
+EXPECT_EXIT 0
+RUN "echo fw_slot_writable $(( {{fw_slot}} != 1 || ({{frmw}} & 1) == 0 ))"
+EXPECT "fw_slot_writable" EQ 1
+RUN "echo fw_differs_from_current $([ '{{fr_before}}' != '{{fw_expected_rev}}' ] && echo 1 || echo 0)"
+EXPECT "fw_differs_from_current" EQ 1
+RUN "test -r {{fw_image}} && echo fw_image_readable 1"
+EXPECT_EXIT 0
+EXPECT "fw_image_readable" EQ 1
+
+# 3. download, 4. commit (action 1: replace + activate at next reset)
+RUN "tools/guard.sh {{allow_destructive}} nvme fw-download {{ctrl}} --fw={{fw_image}}"
+EXPECT_EXIT 0
+EXPECT_REGEX "(?i)success"
+RUN "tools/guard.sh {{allow_destructive}} nvme fw-commit {{ctrl}} --slot={{fw_slot}} --action=1"
+EXPECT_EXIT 0
+EXPECT_REGEX "(?i)success"
+RUN "nvme fw-log {{ctrl}} | python3 tools/nvme_util.py afi"
+EXPECT_EXIT 0
+EXPECT "next_slot" EQ {{fw_slot}}
+
+# 5. reset / power cycle (hardware-specific hook) and wait for the controller
+RUN "{{fw_activate_cmd}}"
+EXPECT_EXIT 0
+RUN "tools/wait_until.sh {{fw_wait_s}} 2 'nvme id-ctrl {{ctrl}}'"
+EXPECT_EXIT 0
+
+# 6-7. identify again: revision must be the expected one, the slot active, nothing pending
+RUN "nvme id-ctrl {{ctrl}} | python3 tools/nvme_util.py kv fr"
+EXPECT_EXIT 0
+EXPECT "fr" CONTAINS "{{fw_expected_rev}}"
+RUN "nvme fw-log {{ctrl}} | python3 tools/nvme_util.py afi"
+EXPECT_EXIT 0
+EXPECT "active_slot" EQ {{fw_slot}}
+EXPECT "next_slot" EQ 0
+
+END

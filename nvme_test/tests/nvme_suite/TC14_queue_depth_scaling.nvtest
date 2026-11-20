@@ -1,0 +1,20 @@
+# TC14 (extended list) - Queue Depth Variation: QD1 -> 4 -> 16 -> 32 -> 64   (read-only workload, non-destructive)
+# Pattern: a shell `for` inside ONE RUN sweeps a parameter and prints `qdNN <iops>` lines (so each point is its own EXPECT field);
+#          `nvme_util.py monotonic` then asserts the scaling trend (no drop larger than 5 %).
+# Note: the framework has no list/iteration construct besides `LOOP <n>` (repeat the same command) - sweeps live in the shell.
+TEST "TC14 Queue Depth Variation"
+
+RUN "mkdir -p {{work_dir}}"
+EXPECT_EXIT 0
+RUN "for q in 1 4 16 32 64; do fio --name=qd$q --filename={{ns}} --rw=randread --bs=4k --iodepth=$q --numjobs=1 --direct=1 --ioengine=libaio --runtime={{fio_short_runtime}} --time_based --output-format=json | python3 tools/fio_metrics.py --metric read_iops | sed \"s/^/qd$q /\"; done | tee {{work_dir}}/qd_sweep.txt"
+EXPECT_EXIT 0
+EXPECT "qd1" GT 0
+EXPECT "qd4" GT 0
+EXPECT "qd16" GT 0
+EXPECT "qd32" GT 0
+EXPECT "qd64" GE {{min_qd64_iops}}
+RUN "python3 tools/nvme_util.py monotonic < {{work_dir}}/qd_sweep.txt"
+EXPECT_EXIT 0
+EXPECT "non_monotonic" EQ 0
+
+END

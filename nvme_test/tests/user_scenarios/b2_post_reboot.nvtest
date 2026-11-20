@@ -1,0 +1,18 @@
+# Scenario (b) PHASE 2 - run AFTER the reboot (wrapper / systemd calls it).
+TEST "Reboot persistence - POST: value after reboot must equal value before reboot"
+
+# value saved by phase 1 (survives reboot because it is on disk)
+RUN "cat {{state_file}}" CAPTURE pre_value
+EXPECT_EXIT 0
+
+# current value after reboot must contain exactly that token
+RUN "nvme get-feature {{device0}} -f {{feature_id}}"
+EXPECT_EXIT 0
+EXPECT "Current value" CONTAINS "{{pre_value}}"
+
+# optional: the SAVED copy (select=2) must match too
+RUN "nvme get-feature {{device0}} -f {{feature_id}} -s 2"
+EXPECT_EXIT 0
+EXPECT "Current value" CONTAINS "{{pre_value}}"
+
+END
